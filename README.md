@@ -5,7 +5,7 @@ Project DEMON CORE with 12 units numbered from 1 to 12.
 ## Units
 
 - [orchestrator.py (Unit 1)](https://github.com/Secruted/DEMON-CORE/issues/1) → [File](https://github.com/Secruted/DEMON-CORE/blob/main/orchestrator.py)
-- [Unit 2](https://github.com/Secruted/DEMON-CORE/issues/2)
+- [harvester.py (Unit 2)](https://github.com/Secruted/DEMON-CORE/issues/2) → [File](https://github.com/Secruted/DEMON-CORE/blob/main/harvester.py)
 - [Unit 3](https://github.com/Secruted/DEMON-CORE/issues/3)
 - [Unit 4](https://github.com/Secruted/DEMON-CORE/issues/4)
 - [Unit 5](https://github.com/Secruted/DEMON-CORE/issues/5)
