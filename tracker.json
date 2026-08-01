@@ -1,0 +1,15 @@
+{
+  "shane": {
+    "room": 1,
+    "line": 0
+  },
+  "negan": {
+    "file": null,
+    "idx": 0
+  },
+  "warehouse": {
+    "processed": [],
+    "current": null,
+    "idx": 0
+  }
+}
