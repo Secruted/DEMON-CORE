@@ -1,0 +1,7 @@
+{
+  "min_mission_delay": 5,
+  "max_mission_delay": 15,
+  "sleep_interval": 60,
+  "lead_ttl": 86400,
+  "persistence_enabled": true
+}
