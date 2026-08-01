@@ -1,0 +1,11 @@
+{
+  "orchestrator_targets": [
+    { "url": "https://www.google.com/search?q=site:pastebin.com+mnemonic", "type": "ROUTER" },
+    { "url": "https://github.com/search?q=AWS_SECRET_ACCESS_KEY&type=code", "type": "ROUTER" },
+    { "url": "https://pastebin.com/archive", "type": "SOURCE" },
+    { "url": "https://gist.github.com/discover", "type": "SOURCE" }
+  ],
+  "router_cadence": 3,
+  "curiosity_decay": 0.05,
+  "revive_threshold": 20
+}
