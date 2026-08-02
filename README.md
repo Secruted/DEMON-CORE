@@ -1,22 +1,28 @@
 # DEMON CORE 🕷️
 
-Project DEMON CORE - Modular Proxy-Powered Harvesting System
+Modular Proxy-Powered Harvesting & Reconnaissance System
 
-## Core Units
+## Core Modules
 
-- [orchestrator.py (Unit 1)](https://github.com/Secruted/DEMON-CORE/blob/main/orchestrator.py)
-- [harvester.py (Unit 2)](https://github.com/Secruted/DEMON-CORE/blob/main/harvester.py)
-- [router.py](https://github.com/Secruted/DEMON-CORE/blob/main/router.py)
-- [content_parser.py](https://github.com/Secruted/DEMON-CORE/blob/main/content_parser.py)
-- [db_manager.py](https://github.com/Secruted/DEMON-CORE/blob/main/db_manager.py)
-- [maggie.py](https://github.com/Secruted/DEMON-CORE/blob/main/maggie.py)
-- [negan.py](https://github.com/Secruted/DEMON-CORE/blob/main/negan.py)
-- [negan_config.py](https://github.com/Secruted/DEMON-CORE/blob/main/negan_config.py)
-- [bip39_validator.py](https://github.com/Secruted/DEMON-CORE/blob/main/bip39_validator.py)
-- [feeder.py](https://github.com/Secruted/DEMON-CORE/blob/main/feeder.py)
-- [elite_check.py](https://github.com/Secruted/DEMON-CORE/blob/main/elite_check.py)
-- [check_sentinel.py](https://github.com/Secruted/DEMON-CORE/blob/main/check_sentinel.py)
-- [clear_cooling.py](https://github.com/Secruted/DEMON-CORE/blob/main/clear_cooling.py)
+| File | Description |
+|------|-------------|
+| `orchestrator.py` | Main system coordinator |
+| `harvester.py` | Execution engine |
+| `router.py` | Target & path generator |
+| `content_parser.py` | Hybrid JSON/HTML content analyzer |
+| `db_manager.py` | Encrypted SQLite database manager |
+| `maggie.py` | Dead proxy handler |
+| `negan.py` | Proxy warehouse supplier |
+| `negan_config.py` | Central configuration |
+| `bip39_validator.py` | BIP-39 seed phrase validator |
+| `domain_parser.py` | OSINT domain & subdomain recon |
+| `feeder.py` | Google Dork target feeder |
+| `messenger.py` | Alert dispatcher (Telegram) |
+| `elite_check.py` | Elite proxy verifier |
+| `check_sentinel.py` | Quick proxy health check |
+| `clear_cooling.py` | Hospital room cleaner |
+| `final_bypass.py` | SSL verification bypass injector |
+| `fix_ssl.py` | Alternative SSL patch |
 
 ## Config Files
 
@@ -26,4 +32,5 @@ Project DEMON CORE - Modular Proxy-Powered Harvesting System
 - `transport.json`
 
 ---
-Created & maintained via connected GitHub tools.
+
+**Note:** Some supporting modules referenced in the code (`statuses.py`, `shane.py`, `proxy_manager.py`, `transport_manager.py`, `telegram_notifier.py`, `bip39_english.txt`) are still missing and need to be added for the system to run fully.
