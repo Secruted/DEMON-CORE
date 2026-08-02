@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 import signal
+import asyncio
 from pathlib import Path
 
 # [Imports for Core Components]
@@ -95,7 +96,6 @@ def live_panel(logger):
     shane = tracker.get("shane", {})
     negan = tracker.get("negan", {})
 
-    # Simple text-based status log
     logger.info(
         f"{C_CYAN}[LIVE]{C_RESET} "
         f"UP={uptime}s | "
@@ -107,7 +107,7 @@ def live_panel(logger):
 
 # ===================== [MAIN CORE] =====================
 
-def main():
+async def main():
     # Register Kill Switch
     signal.signal(signal.SIGINT, force_exit)
 
@@ -126,7 +126,7 @@ def main():
     except:
         master_pwd = "123"
 
-    print(f"\n🫟 🪼 🦠 {C_GREEN}SYSTEM CORE ONLINE{C_RESET} 🦠 🪼 🫟\n")
+    print(f"\n💦 🪼 🦠 {C_GREEN}SYSTEM CORE ONLINE (ULTRA 911 ASYNC){C_RESET} 🦠 🪼 💦\n")
 
     try:
         db = DBManager("watcher.db", master_pwd)
@@ -140,24 +140,20 @@ def main():
 
         logger.info(f"| [INIT] Proxy Tank Level: {real_fuel} live proxies.")
         logger.info("| [INIT] Intelligence Core Online.")
-        logger.info("| [INIT] Harvester Connected.")
+        logger.info("| [INIT] Harvester Connected (Async Swarm Mode).")
         logger.info("=== MISSION STARTED ===")
 
-        last_panel = 0
-        panel_interval = runtime.get("panel_interval", 20) # Default to 20s to avoid log spam
+        # Run the async swarm mission
+        await harvester.start_mission()
 
-        while True:
-            now = time.time()
-            if now - last_panel >= panel_interval:
-                live_panel(logger)
-                last_panel = now
+        logger.info("=== MISSION COMPLETE ===")
 
-            # Execute one mission cycle
-            harvester.start_mission()
-            time.sleep(0.1)
     except Exception as e:
         logger.critical(f"[FATAL] System failure: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n{C_RED}[!] System halted by user.{C_RESET}")
