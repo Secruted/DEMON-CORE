@@ -116,7 +116,7 @@ class Harvester:
         if status == Status.FAILED_FETCH:
             proxy = self.transport.current_proxy
             if proxy:
-                # CPU Bound / File IO offloaded to thread to prevent async block
+                # File IO offloaded to thread to prevent async block
                 await asyncio.to_thread(self._evacuate_casualty, proxy)
                 
         elif status == Status.HARVEST_SUCCESS:
@@ -125,21 +125,21 @@ class Harvester:
                 val_short = value[:40] + "..." if len(value) > 40 else value
                 print(f"             └── {C_YELLOW}{item_type}{C_RESET}: {val_short}")
                 
-                # Non-Blocking Database Vault Injection
-                await asyncio.to_thread(self._save_asset_safe, item_type, value, url)
+                # Fully non-blocking async vault write
+                try:
+                    await self.db.add_leak(item_type, value, url)
+                except Exception:
+                    # Fallback to file if DB fails
+                    await asyncio.to_thread(self._save_to_file, url, item_type, value)
                 
             self.target_warnings[domain] = 0
 
         elif status in [Status.BLOCKED, Status.WAF_DETECTED]:
             self.target_warnings[domain] = self.target_warnings.get(domain, 0) + 1
 
-    def _save_asset_safe(self, item_type, value, source):
-        # Fallback wrapper for existing Sync DB Manager
-        try:
-            self.db.add_leak(item_type, value, source)
-        except Exception:
-            with open("loots.txt", "a") as f:
-                f.write(f"[{self._timestamp()}] {item_type} | {source} | {value}\n")
+    def _save_to_file(self, url, item_type, value):
+        with open("loots.txt", "a") as f:
+            f.write(f"[{self._timestamp()}] {item_type} | {url} | {value}\n")
 
     def _evacuate_casualty(self, proxy_str):
         proxy_clean = proxy_str.split('|')[0].strip()
