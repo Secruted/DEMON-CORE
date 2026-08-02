@@ -130,6 +130,8 @@ async def main():
 
     try:
         db = DBManager("watcher.db", master_pwd)
+        await db.init_db()   # Initialize async aiosqlite connection + encryption
+
         proxy_mgr = ProxyManager(transport_cfg.get("proxy_file", "proxy.txt"))
         transport_mgr = TransportManager(transport_cfg)
 
@@ -140,6 +142,7 @@ async def main():
 
         logger.info(f"| [INIT] Proxy Tank Level: {real_fuel} live proxies.")
         logger.info("| [INIT] Intelligence Core Online.")
+        logger.info("| [INIT] Async Encrypted Vault Online (aiosqlite).")
         logger.info("| [INIT] Harvester Connected (Async Swarm Mode).")
         logger.info("=== MISSION STARTED ===")
 
@@ -147,6 +150,9 @@ async def main():
         await harvester.start_mission()
 
         logger.info("=== MISSION COMPLETE ===")
+
+        # Graceful shutdown
+        await db.close()
 
     except Exception as e:
         logger.critical(f"[FATAL] System failure: {e}", exc_info=True)
