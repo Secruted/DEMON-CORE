@@ -1,20 +1,14 @@
 import os
-import sys
 import json
 import random
-
-# DΞMON CORE v2.0 - ROUTER MODULE
-# PROTOCOL: TARGET_GENERATOR & INTELLIGENCE FUSION
-# ARCHITECTURE: GENERATOR (Yields paths to Harvester)
+from pathlib import Path
 
 class Router:
     """
-    Strategic Generator.
-    - Same inputs/outputs as before.
-    - Adds ONLY safety & stability guards:
-        * Cardinality caps
-        * Deterministic ordering
-        * Optional sampling (disabled by default)
+    Smart Path Generator (Phase 2)
+    - Dynamic path generation based on target type
+    - Expanded intelligent wordlists
+    - Still supports classic high-value paths
     """
 
     def __init__(self, targets_file="targets.txt", recon_file="recon_intel.json"):
@@ -22,167 +16,97 @@ class Router:
         self.recon_file = recon_file
         self.targets = []
 
-        # -------- SAFETY / STABILITY GUARDS (DEFAULTS PRESERVE BEHAVIOR) --------
-        # Hard cap to prevent combinatorial explosion
-        # Can be set via env vars: export ROUTER_MAX_TARGETS=50
-        self.MAX_TARGETS = int(os.getenv("ROUTER_MAX_TARGETS", "0"))  # 0 = unlimited (default)
-        self.MAX_ROUTES  = int(os.getenv("ROUTER_MAX_ROUTES", "0"))   # 0 = unlimited (default)
-
-        # Optional sampling (OFF by default)
-        self.SAMPLE_TARGETS = int(os.getenv("ROUTER_SAMPLE_TARGETS", "0"))  # 0 = disabled
-
-        # Deterministic order for reproducibility
+        self.MAX_TARGETS = int(os.getenv("ROUTER_MAX_TARGETS", "0"))
+        self.MAX_ROUTES  = int(os.getenv("ROUTER_MAX_ROUTES", "0"))
+        self.SAMPLE_TARGETS = int(os.getenv("ROUTER_SAMPLE_TARGETS", "0"))
         self.DETERMINISTIC = True
 
-        # ----------------------------------------------------------------------
-
-        # [🔥 THE MASTER GOLD LIST]
-        self.GOLD_PATHS = [
-            "/api/v1/users",
-            "/api/v1/user/profile",
-            "/api/v1/wallet/balance",
-            "/api/v1/admin/users",
-            "/api/v2/users",
-            "/api/config",
-            "/api/settings",
-            "/mobile/config.json",
-            "/app-data.json",
-            "/v1/config",
-
-            "/.env",
-            "/.env.save",
-            "/.env.bak",
-            "/.env.production",
-            "/.env.local",
-            "/docker-compose.yml",
-            "/config/database.yml",
-            "/sftp-config.json",
-            "/.git/config",
-            "/.vscode/sftp.json",
-            "/web.config",
-
-            "/backup.sql",
-            "/database.sql",
-            "/dump.sql",
-            "/users.sql",
-            "/data/backup.tar.gz",
-            "/db_backup.sql",
-            "/backup.zip",
-            "/site_backup.zip",
-
-            "/wallet.json",
-            "/keystore.json",
-            "/presale-config.json",
-            "/id_rsa",
-            "/id_rsa.pub",
-            "/secrets.json",
-            "/claim.json",
+        # High-value classic paths
+        self.CORE_PATHS = [
+            "/.env", "/.env.local", "/.env.production", "/.env.bak", "/.env.save",
+            "/api/config", "/api/v1/config", "/api/settings", "/api/v1/users",
+            "/api/v1/user/profile", "/api/v1/wallet/balance", "/api/v1/admin/users",
+            "/config.json", "/config.js", "/app-config.json", "/settings.json",
+            "/backup.sql", "/database.sql", "/dump.sql", "/db.sql",
+            "/wallet.json", "/keystore.json", "/secrets.json",
+            "/.git/config", "/docker-compose.yml", "/web.config",
+            "/id_rsa", "/id_rsa.pub", "/.ssh/id_rsa",
+            "/admin", "/administrator", "/api", "/graphql", "/swagger.json",
+            "/v1/api", "/v2/api", "/internal/config", "/debug/vars"
         ]
 
-        # Initial load
+        # Dynamic prefixes & suffixes for smarter generation
+        self.PREFIXES = ["", "api/", "api/v1/", "api/v2/", "v1/", "v2/", "admin/", "internal/", "backend/", "app/", "mobile/"]
+        self.SUFFIXES = ["config", "settings", "env", "secret", "secrets", "key", "keys", "token", "wallet", "backup", "dump", "users", "profile", "balance", "admin"]
+        self.EXTENSIONS = ["", ".json", ".js", ".yml", ".yaml", ".env", ".bak", ".old", ".txt", ".sql"]
+
         self.refresh_targets()
 
-    # ------------------------------------------------------------------
-    # TARGET INGESTION (UNCHANGED LOGIC + CAPS ONLY)
-    # ------------------------------------------------------------------
+    def _generate_smart_paths(self):
+        """Generate additional paths dynamically."""
+        paths = set(self.CORE_PATHS)
+
+        for prefix in self.PREFIXES:
+            for suffix in self.SUFFIXES:
+                for ext in self.EXTENSIONS:
+                    path = f"/{prefix}{suffix}{ext}".replace("//", "/")
+                    paths.add(path)
+
+        return list(paths)
+
     def refresh_targets(self):
         raw_targets = set()
 
-        # SOURCE 1: targets.txt
-        if not os.path.exists(self.targets_file):
-            try:
-                with open(self.targets_file, 'w') as f:
-                    f.write("# Put target domains here (e.g., target.com)\n")
-            except Exception:
-                pass
-        else:
-            try:
-                with open(self.targets_file, 'r') as f:
-                    for line in f:
-                        clean = line.strip()
-                        if clean and not clean.startswith("#"):
-                            clean = clean.replace("https://", "").replace("http://", "").strip("/")
-                            if clean:
-                                raw_targets.add(clean)
-            except Exception:
-                pass
+        if Path(self.targets_file).exists():
+            with open(self.targets_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    clean = line.strip()
+                    if clean and not clean.startswith("#"):
+                        clean = clean.replace("https://", "").replace("http://", "").strip("/")
+                        if clean:
+                            raw_targets.add(clean)
 
-        # SOURCE 2: recon_intel.json
-        if os.path.exists(self.recon_file):
+        if Path(self.recon_file).exists():
             try:
-                with open(self.recon_file, 'r') as f:
-                    intel_data = json.load(f)
-                    if isinstance(intel_data, list):
-                        for entry in intel_data:
-                            root = entry.get("root_domain")
-                            if root:
-                                raw_targets.add(root)
-                            subs = entry.get("found_subdomains", [])
-                            for sub in subs:
+                with open(self.recon_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for entry in data:
+                            if entry.get("root_domain"):
+                                raw_targets.add(entry["root_domain"])
+                            for sub in entry.get("found_subdomains", []):
                                 if sub:
                                     raw_targets.add(sub)
-            except Exception:
+            except:
                 pass
 
-        # Deterministic ordering for reproducibility
-        targets = list(raw_targets)
-        if self.DETERMINISTIC:
-            targets.sort()
+        targets = sorted(list(raw_targets)) if self.DETERMINISTIC else list(raw_targets)
 
-        # Optional sampling (OFF by default)
         if self.SAMPLE_TARGETS and self.SAMPLE_TARGETS < len(targets):
             targets = random.sample(targets, self.SAMPLE_TARGETS)
 
-        # Hard cap on targets (OFF by default)
-        if self.MAX_TARGETS and self.MAX_TARGETS > 0:
-            if len(targets) > self.MAX_TARGETS:
-                targets = targets[:self.MAX_TARGETS]
+        if self.MAX_TARGETS and len(targets) > self.MAX_TARGETS:
+            targets = targets[:self.MAX_TARGETS]
 
         self.targets = targets
+        self.smart_paths = self._generate_smart_paths()
 
-    # ------------------------------------------------------------------
-    # GENERATOR (UNCHANGED OUTPUT, ADDS ROUTE CAP ONLY)
-    # ------------------------------------------------------------------
     def generator(self):
-        # Refresh to catch updates
         self.refresh_targets()
-
         if not self.targets:
             return
 
         emitted = 0
         for target in self.targets:
             base_url = f"https://{target}"
-            for path in self.GOLD_PATHS:
+            for path in self.smart_paths:
                 yield f"{base_url}{path}"
                 emitted += 1
-
-                # Hard cap on total routes (OFF by default)
-                if self.MAX_ROUTES and self.MAX_ROUTES > 0:
-                    if emitted >= self.MAX_ROUTES:
-                        return
+                if self.MAX_ROUTES and emitted >= self.MAX_ROUTES:
+                    return
 
     def get_route_count(self):
-        # Conservative estimate respecting caps
-        base = len(self.targets) * len(self.GOLD_PATHS)
-        
-        # Apply Route Cap logic for estimation
-        if self.MAX_ROUTES and self.MAX_ROUTES > 0:
-            if base > self.MAX_ROUTES:
-                return self.MAX_ROUTES
-        
+        base = len(self.targets) * len(getattr(self, "smart_paths", self.CORE_PATHS))
+        if self.MAX_ROUTES and base > self.MAX_ROUTES:
+            return self.MAX_ROUTES
         return base
-
-# Self-test
-if __name__ == "__main__":
-    print("DΞMON ROUTER v2.0 (Architectural Safe Mode) ONLINE")
-    r = Router()
-    print(f"Targets Loaded: {len(r.targets)}")
-    print(f"Estimated Routes: {r.get_route_count()}")
-    
-    # Test Generator
-    gen = r.generator()
-    try:
-        print("Sample Route:", next(gen))
-    except StopIteration:
-        print("No routes generated.")
