@@ -1,0 +1,45 @@
+{
+  "max_seen_limit": 15000,
+  "regex_patterns": [
+    {
+      "type": "AWS_ACCESS_KEY",
+      "pattern": "AKIA[0-9A-Z]{16}"
+    },
+    {
+      "type": "AWS_SECRET_KEY",
+      "pattern": "(?i)aws(.{0,20})?(secret|access).{0,20}['\"][0-9a-zA-Z\\/+]{40}['\"]"
+    },
+    {
+      "type": "GITHUB_TOKEN",
+      "pattern": "ghp_[0-9a-zA-Z]{36}"
+    },
+    {
+      "type": "GITHUB_OAUTH",
+      "pattern": "gho_[0-9a-zA-Z]{36}"
+    },
+    {
+      "type": "GENERIC_API_KEY",
+      "pattern": "(?i)(api[_-]?key|apikey)['\"]?\\s*[:=]\\s*['\"][0-9a-zA-Z\\-_]{20,}['\"]"
+    },
+    {
+      "type": "CRYPTO_SEED",
+      "pattern": "\\b([a-z]+\\s){11,23}[a-z]+\\b"
+    },
+    {
+      "type": "PRIVATE_KEY",
+      "pattern": "-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----"
+    },
+    {
+      "type": "JWT_TOKEN",
+      "pattern": "eyJ[A-Za-z0-9-_=]+\\.eyJ[A-Za-z0-9-_=]+\\.?[A-Za-z0-9-_.+/=]*"
+    },
+    {
+      "type": "SLACK_TOKEN",
+      "pattern": "xox[baprs]-[0-9a-zA-Z]{10,48}"
+    },
+    {
+      "type": "DISCORD_TOKEN",
+      "pattern": "[MN][A-Za-z\\d]{23}\\.[\\w-]{6}\\.[\\w-]{27}"
+    }
+  ]
+}
