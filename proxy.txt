@@ -1,0 +1,5 @@
+# Put your proxies here (one per line)
+# Examples:
+# 192.168.1.1:8080
+# http://user:pass@ip:port
+# socks5://ip:port
