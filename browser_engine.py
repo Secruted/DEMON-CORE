@@ -1,17 +1,14 @@
 """
-Browser Engine Foundation (Phase 4 & 5)
+Browser Engine - Playwright Integration
 ---------------------------------------
-This module prepares the architecture for real browser automation.
+Optional heavy stealth engine.
+Activated only when needed (not default).
 
-Current status:
-- Placeholder / foundation only
-- Ready for Playwright or Camoufox integration on VPS
-- Not active by default (HTTP async engine remains primary)
+Requirements on VPS:
+    pip install playwright
+    playwright install firefox
 
-To activate later:
-1. Install: pip install playwright
-2. playwright install firefox
-3. Or use Camoufox for higher stealth
+For higher stealth later: replace with Camoufox.
 """
 
 import logging
@@ -20,50 +17,78 @@ from typing import Optional, Tuple
 logger = logging.getLogger("BROWSER_ENGINE")
 
 class BrowserEngine:
-    """
-    Optional heavy browser engine.
-    Designed to be used only when high stealth is required.
-    """
-
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, proxy: str = None):
         self.headless = headless
+        self.proxy = proxy
+        self.playwright = None
         self.browser = None
         self.context = None
-        self.enabled = False  # Disabled by default
+        self.enabled = False
 
     async def start(self):
-        """Initialize browser (Playwright/Camoufox)."""
         try:
-            # from playwright.async_api import async_playwright
-            # self.playwright = await async_playwright().start()
-            # self.browser = await self.playwright.firefox.launch(headless=self.headless)
-            # self.context = await self.browser.new_context()
-            # self.enabled = True
-            logger.warning("[BROWSER] Engine foundation loaded but not activated (install Playwright/Camoufox to enable).")
+            from playwright.async_api import async_playwright
+
+            self.playwright = await async_playwright().start()
+
+            launch_args = {
+                "headless": self.headless,
+            }
+
+            if self.proxy:
+                # proxy format: http://ip:port or socks5://ip:port
+                launch_args["proxy"] = {"server": self.proxy}
+
+            self.browser = await self.playwright.firefox.launch(**launch_args)
+
+            self.context = await self.browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+
+            self.enabled = True
+            logger.info("[BROWSER] Playwright Firefox engine started successfully.")
+
+        except ImportError:
+            logger.error("[BROWSER] Playwright not installed. Run: pip install playwright && playwright install firefox")
+            self.enabled = False
         except Exception as e:
-            logger.error(f"[BROWSER] Failed to start: {e}")
+            logger.error(f"[BROWSER] Failed to start engine: {e}")
             self.enabled = False
 
-    async def request(self, url: str, proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
-        """
-        Fetch a page using real browser.
-        Returns (html, final_url) or (None, url)
-        """
-        if not self.enabled:
+    async def request(self, url: str) -> Tuple[Optional[str], str]:
+        if not self.enabled or not self.context:
             return None, url
 
-        # Placeholder for real implementation
-        # page = await self.context.new_page()
-        # if proxy: ... set proxy
-        # await page.goto(url, wait_until="domcontentloaded")
-        # content = await page.content()
-        # final = page.url
-        # await page.close()
-        # return content, final
+        page = None
+        try:
+            page = await self.context.new_page()
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        return None, url
+            if response and response.status == 200:
+                content = await page.content()
+                final_url = page.url
+                return content, final_url
+            else:
+                return None, url
+
+        except Exception as e:
+            logger.debug(f"[BROWSER] Request failed for {url}: {e}")
+            return None, url
+        finally:
+            if page:
+                await page.close()
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
-        logger.info("[BROWSER] Engine closed.")
+        try:
+            if self.context:
+                await self.context.close()
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+            logger.info("[BROWSER] Engine closed.")
+        except Exception:
+            pass
