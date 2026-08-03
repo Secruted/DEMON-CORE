@@ -1,0 +1,44 @@
+# Sensitive & Runtime files
+*.db
+*.sqlite
+*.sqlite3
+watcher.db
+*.log
+nohup.out
+*.tmp
+
+# Proxy & Target data
+proxy.txt
+proxy_*.txt
+proxies_*.txt
+proxy_elite.txt
+proxy_alive.txt
+tank/
+cooling/
+graveyard.txt
+loots.txt
+
+# Config with secrets (keep example only)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Progress & cache
+progress.json
+*.cache
