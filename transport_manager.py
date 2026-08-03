@@ -1,10 +1,12 @@
+import time
 import random
 import asyncio
 import aiohttp
 import logging
 from aiohttp import TCPConnector, ClientTimeout
+from proxy_scoring import ProxyScorer
 
-# ULTRA 911 ARCHITECTURE: ASYNC TRANSPORT LAYER
+# ULTRA 911 ARCHITECTURE: ASYNC TRANSPORT LAYER + SMART SCORING
 
 class TransportManager:
     def __init__(self, transport_cfg):
@@ -14,9 +16,12 @@ class TransportManager:
         self.user_agents = self.cfg.get("user_agents", [])
         self.proxy_file = self.cfg.get("proxy_file", "proxy.txt")
         self.timeout = ClientTimeout(total=self.cfg.get("connection_timeout", 15))
-        
+
         self.current_proxy = None
         self.session = None
+
+        # Smart Scoring System
+        self.scorer = ProxyScorer(proxy_file=self.proxy_file)
 
         self.mobile_agents = [
             "Dalvik/2.1.0 (Linux; U; Android 10; SM-G960F)",
@@ -26,31 +31,17 @@ class TransportManager:
             "okhttp/4.9.1"
         ]
 
-        self._load_proxies()
-
-    def _load_proxies(self):
-        try:
-            with open(self.proxy_file, "r") as f:
-                self.proxies = [line.strip() for line in f if line.strip()]
-            self.logger.info(f"[ULTRA 911] Transport Layer armed with {len(self.proxies)} proxies.")
-        except FileNotFoundError:
-            self.proxies = []
-            self.logger.warning("[!] proxy.txt missing. Stealth disabled.")
-
     async def init_session(self):
-        """
-        The Nuclear Reactor: Opens 5000 concurrent sockets.
-        Bypasses SSL verification for extreme speed.
-        """
         if not self.session:
             connector = TCPConnector(limit=5000, ssl=False, enable_cleanup_closed=True)
             self.session = aiohttp.ClientSession(connector=connector, timeout=self.timeout)
-            self.logger.info("[ULTRA 911] Asynchronous TCP Pool Initialized (5000 connections limit).")
+            self.logger.info("[TRANSPORT] Async TCP Pool + ProxyScorer online.")
 
     async def close_session(self):
-        """Graceful shutdown of the async engine."""
         if self.session and not self.session.closed:
             await self.session.close()
+        # Persist scores on shutdown
+        await self.scorer.save_state()
 
     def _get_mimicry_headers(self):
         if self.mobile_agents and random.random() > 0.1:
@@ -60,41 +51,60 @@ class TransportManager:
         else:
             agent = "D-CORE-911/3.0"
 
-        headers = {
+        return {
             'User-Agent': agent,
             'Accept': 'application/json, text/plain, */*',
             'Connection': 'keep-alive',
             'X-Requested-With': 'XMLHttpRequest'
         }
-        return headers
 
     async def request(self, url):
         """
-        The Async Kill Shot.
-        Returns (html_text, final_url) or (None, url) instantly.
+        Smart request with scoring integration.
+        Returns (html_text, final_url) or (None, url)
         """
         if not self.session:
             await self.init_session()
 
         headers = self._get_mimicry_headers()
-        
-        # Fast Proxy Rotation
-        if self.proxies:
-            self.current_proxy = random.choice(self.proxies)
-        else:
-            self.current_proxy = None
+
+        # Get best proxy from Scorer
+        self.current_proxy = await self.scorer.get_best_proxy()
 
         formatted_proxy = None
         if self.current_proxy:
             formatted_proxy = self.current_proxy if "://" in self.current_proxy else f"http://{self.current_proxy}"
 
+        start_time = time.time()
+        success = False
+        text = None
+        final_url = url
+
         try:
-            async with self.session.get(url, headers=headers, proxy=formatted_proxy, allow_redirects=True) as response:
+            async with self.session.get(
+                url,
+                headers=headers,
+                proxy=formatted_proxy,
+                allow_redirects=True
+            ) as response:
                 if response.status == 200:
                     text = await response.text()
-                    return text, str(response.url)
+                    final_url = str(response.url)
+                    success = True
                 else:
-                    return None, url
-        except Exception as e:
-            # Absolute silence on failures to prevent Terminal bottleneck
-            return None, url
+                    success = False
+        except Exception:
+            success = False
+
+        # Record result into Scoring system
+        elapsed = time.time() - start_time
+        if self.current_proxy:
+            await self.scorer.record_result(
+                proxy=self.current_proxy,
+                success=success,
+                response_time=elapsed
+            )
+
+        if success:
+            return text, final_url
+        return None, url
