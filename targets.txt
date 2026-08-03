@@ -1,0 +1,16 @@
+# DEMON CORE - Target List
+# Add one domain per line (without http/https)
+
+# Public test / vulnerable labs (safe for testing)
+testphp.vulnweb.com
+scantest.net
+demo.testfire.net
+testasp.vulnweb.com
+testaspnet.vulnweb.com
+httpbin.org
+
+# Common high-value patterns (examples - replace with real targets)
+# pastebin.com
+# gist.github.com
+# gitlab.com
+# bitbucket.org
