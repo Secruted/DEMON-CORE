@@ -1,4 +1,4 @@
-# DEMON CORE 🕷️
+# DEMON CORE 🕷️🇨🇳
 
 **Modular Proxy-Powered Harvesting & Reconnaissance System**
 
