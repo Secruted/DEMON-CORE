@@ -4,7 +4,7 @@ import asyncio
 import logging
 import random
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 from enum import Enum
 
@@ -24,11 +24,12 @@ class ProxyStats:
     total_response_time: float = 0.0
     last_used: float = 0.0
     last_checked: float = 0.0
-    score: float = 50.0          # Start with neutral score
+    score: float = 50.0
     proxy_type: ProxyType = ProxyType.UNKNOWN
     consecutive_fails: int = 0
     is_alive: bool = True
-    banned_until: float = 0.0    # Timestamp until which this proxy is banned
+    banned_until: float = 0.0
+    last_successful_scheme: Optional[str] = None  # e.g. "http", "socks5", "socks4"
 
     @property
     def success_rate(self) -> float:
@@ -44,21 +45,11 @@ class ProxyStats:
         return self.total_response_time / self.success
 
     def calculate_score(self) -> float:
-        """
-        Advanced scoring formula:
-        - Success rate has high weight
-        - Response time penalty
-        - Consecutive fails heavy penalty
-        - Type bonus (Residential/Mobile better)
-        """
         if not self.is_alive or time.time() < self.banned_until:
             return 0.0
 
-        # Base score from success rate (0-70 points)
         rate_score = self.success_rate * 70
 
-        # Response time score (0-20 points)
-        # Faster than 1.5s = full points, slower = less
         if self.avg_response_time <= 1.5:
             speed_score = 20
         elif self.avg_response_time <= 4.0:
@@ -66,7 +57,6 @@ class ProxyStats:
         else:
             speed_score = 0
 
-        # Type bonus
         type_bonus = {
             ProxyType.RESIDENTIAL: 15,
             ProxyType.MOBILE: 12,
@@ -74,7 +64,6 @@ class ProxyStats:
             ProxyType.UNKNOWN: 5
         }.get(self.proxy_type, 0)
 
-        # Consecutive fails penalty
         fail_penalty = min(self.consecutive_fails * 8, 40)
 
         raw_score = rate_score + speed_score + type_bonus - fail_penalty
@@ -84,11 +73,12 @@ class ProxyStats:
 
 class ProxyScorer:
     """
-    Advanced Proxy Scoring & Management System (Phase 1)
+    Advanced Proxy Scoring & Management System
     - Tracks success/fail/response time
     - Calculates dynamic score
-    - Supports smart selection of best proxies
+    - Smart selection of best proxies
     - Auto-ban on repeated failures
+    - Centralized scheme candidates (HTTP → SOCKS5 → SOCKS4)
     """
 
     def __init__(self, proxy_file: str = "proxy.txt", state_file: str = "proxy_scores.json"):
@@ -98,8 +88,8 @@ class ProxyScorer:
         self.lock = asyncio.Lock()
 
         self.MIN_SCORE_TO_USE = 25.0
-        self.BAN_THRESHOLD = 5          # consecutive fails → temporary ban
-        self.BAN_DURATION = 60 * 15     # 15 minutes ban
+        self.BAN_THRESHOLD = 5
+        self.BAN_DURATION = 60 * 15
 
         self._load_proxies()
         self._load_state()
@@ -135,6 +125,7 @@ class ProxyScorer:
                     p.is_alive = stats.get("is_alive", True)
                     p.banned_until = stats.get("banned_until", 0.0)
                     p.proxy_type = ProxyType(stats.get("proxy_type", "unknown"))
+                    p.last_successful_scheme = stats.get("last_successful_scheme")
             logger.info("[SCORER] Previous scores restored")
         except Exception as e:
             logger.warning(f"[SCORER] Could not load state: {e}")
@@ -151,13 +142,14 @@ class ProxyScorer:
                     "consecutive_fails": stats.consecutive_fails,
                     "is_alive": stats.is_alive,
                     "banned_until": stats.banned_until,
-                    "proxy_type": stats.proxy_type.value
+                    "proxy_type": stats.proxy_type.value,
+                    "last_successful_scheme": stats.last_successful_scheme,
                 }
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
 
-    async def record_result(self, proxy: str, success: bool, response_time: float = 0.0):
-        """Called by the transport/harvester after every request."""
+    async def record_result(self, proxy: str, success: bool, response_time: float = 0.0, scheme: Optional[str] = None):
+        """Called after every request. Optionally record the successful scheme."""
         async with self.lock:
             if proxy not in self.proxies:
                 self.proxies[proxy] = ProxyStats(proxy=proxy)
@@ -170,6 +162,8 @@ class ProxyScorer:
                 stats.total_response_time += response_time
                 stats.consecutive_fails = 0
                 stats.is_alive = True
+                if scheme:
+                    stats.last_successful_scheme = scheme
             else:
                 stats.fail += 1
                 stats.consecutive_fails += 1
@@ -182,7 +176,7 @@ class ProxyScorer:
             stats.calculate_score()
 
     async def get_best_proxy(self) -> Optional[str]:
-        """Returns the highest scoring available proxy."""
+        """Returns the highest scoring available raw proxy string."""
         async with self.lock:
             now = time.time()
             candidates = []
@@ -192,17 +186,52 @@ class ProxyScorer:
                     candidates.append(stats)
 
             if not candidates:
-                # Fallback: try any non-banned proxy
                 candidates = [s for s in self.proxies.values() if s.banned_until <= now]
 
             if not candidates:
                 return None
 
-            # Weighted random choice favoring higher scores
             candidates.sort(key=lambda x: x.score, reverse=True)
-            top = candidates[:max(5, len(candidates)//4)]  # Top 25% or at least 5
+            top = candidates[:max(5, len(candidates)//4)]
             chosen = random.choice(top)
             return chosen.proxy
+
+    def get_scheme_candidates(self, raw_proxy: str) -> List[str]:
+        """
+        Centralized scheme resolution.
+        Returns ordered list of proxy URLs to try.
+
+        Priority:
+        1. If raw_proxy already has a scheme → return it only.
+        2. If we previously succeeded with a scheme → try that first, then the others.
+        3. Otherwise default order: http → socks5 → socks4
+        """
+        if not raw_proxy:
+            return []
+
+        if "://" in raw_proxy:
+            return [raw_proxy]
+
+        # Clean possible leftover scheme-less string
+        clean = raw_proxy.strip()
+
+        # Prefer last known successful scheme if available
+        stats = self.proxies.get(raw_proxy)
+        preferred = None
+        if stats and stats.last_successful_scheme:
+            preferred = stats.last_successful_scheme
+
+        order = []
+        if preferred == "http":
+            order = ["http", "socks5", "socks4"]
+        elif preferred == "socks5":
+            order = ["socks5", "http", "socks4"]
+        elif preferred == "socks4":
+            order = ["socks4", "http", "socks5"]
+        else:
+            order = ["http", "socks5", "socks4"]
+
+        return [f"{scheme}://{clean}" for scheme in order]
 
     async def get_stats_summary(self) -> dict:
         async with self.lock:
