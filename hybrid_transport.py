@@ -6,10 +6,8 @@ Smart request layer that chooses the best engine automatically:
 1. curl_cffi   → Fast + better TLS fingerprint (default)
 2. Playwright (unified BrowserEngine / Chromium) → Escalation when protection is detected
 
-Usage:
-    transport = HybridTransport(proxy_file="proxy.txt")
-    await transport.init()
-    html, final_url = await transport.request(url)
+Now uses centralized scheme candidates from ProxyScorer:
+HTTP → SOCKS5 → SOCKS4 when no scheme is present.
 """
 
 import time
@@ -24,21 +22,19 @@ logger = logging.getLogger("HYBRID_TRANSPORT")
 class HybridTransport:
     def __init__(self, proxy_file: str = "proxy.txt"):
         self.scorer = ProxyScorer(proxy_file=proxy_file)
-        self.current_proxy = None
+        self.current_proxy = None  # raw proxy string from file
 
     async def init(self):
         summary = await self.scorer.get_stats_summary()
         logger.info(f"[HYBRID] Ready | Proxies: {summary['total']} | Alive: {summary['alive']}")
 
-    async def _get_proxy(self) -> Optional[str]:
+    async def _get_raw_proxy(self) -> Optional[str]:
         proxy = await self.scorer.get_best_proxy()
         self.current_proxy = proxy
-        if proxy and "://" not in proxy:
-            return f"http://{proxy}"
         return proxy
 
-    async def _request_curl_cffi(self, url: str, proxy: Optional[str]) -> Tuple[Optional[str], str, bool]:
-        """Fast engine with better TLS fingerprint. Returns (html, final_url, should_escalate)"""
+    async def _request_curl_cffi(self, url: str, proxy_url: str) -> Tuple[Optional[str], str, bool]:
+        """Try a single proxy URL with curl_cffi. Returns (html, final_url, should_escalate)"""
         try:
             from curl_cffi.requests import AsyncSession
 
@@ -47,24 +43,22 @@ class HybridTransport:
                 resp = await session.get(
                     url,
                     headers=headers,
-                    proxy=proxy,
+                    proxy=proxy_url,
                     timeout=20,
                     allow_redirects=True,
                     impersonate="chrome120"
                 )
                 if resp.status_code == 200:
                     return resp.text, str(resp.url), False
-                # Detect protection signals → escalate
                 if resp.status_code in (403, 429, 503) or "cloudflare" in (resp.text or "").lower() or "cf-ray" in str(resp.headers):
                     return None, url, True
                 return None, url, False
         except Exception:
-            return None, url, True  # Fail → escalate
+            return None, url, True
 
-    async def _request_playwright(self, url: str, proxy: Optional[str]) -> Tuple[Optional[str], str]:
-        """Heavy escalation using unified Chromium BrowserEngine."""
+    async def _request_playwright(self, url: str, proxy_url: Optional[str]) -> Tuple[Optional[str], str]:
         try:
-            async with BrowserEngine(headless=True, proxy=proxy, block_resources=True) as engine:
+            async with BrowserEngine(headless=True, proxy=proxy_url, block_resources=True) as engine:
                 if not engine.enabled:
                     return None, url
                 html, final = await engine.request(url)
@@ -75,31 +69,47 @@ class HybridTransport:
 
     async def request(self, url: str) -> Tuple[Optional[str], str]:
         """
-        Smart request with automatic engine selection.
+        Smart request with automatic engine selection + scheme fallback.
         Returns (html, final_url)
         """
-        proxy = await self._get_proxy()
+        raw_proxy = await self._get_raw_proxy()
         start = time.time()
 
-        # Stage 1: curl_cffi
-        html, final_url, should_escalate = await self._request_curl_cffi(url, proxy)
-
-        success = html is not None
-        elapsed = time.time() - start
-
-        if self.current_proxy:
-            await self.scorer.record_result(self.current_proxy, success, elapsed)
-
-        if success:
+        if not raw_proxy:
+            # No proxy available – try direct
+            html, final_url, _ = await self._request_curl_cffi(url, None)
             return html, final_url
 
-        # Stage 2: Escalate to unified BrowserEngine if needed
-        if should_escalate:
-            logger.info(f"[HYBRID] Protection detected → Escalating to Chromium BrowserEngine for {url}")
-            html, final_url = await self._request_playwright(url, proxy)
+        candidates = self.scorer.get_scheme_candidates(raw_proxy)
+        last_should_escalate = True
+
+        for proxy_url in candidates:
+            scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
+            logger.debug(f"[HYBRID] Trying {scheme}:// for {raw_proxy}")
+
+            html, final_url, should_escalate = await self._request_curl_cffi(url, proxy_url)
+            last_should_escalate = should_escalate
+
+            success = html is not None
+            elapsed = time.time() - start
+
+            if success:
+                await self.scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
+                return html, final_url
+            else:
+                # Record partial fail for this attempt (still counts against the raw proxy)
+                await self.scorer.record_result(raw_proxy, False, elapsed)
+
+        # All schemes failed with curl_cffi → escalate to BrowserEngine if needed
+        if last_should_escalate:
+            logger.info(f"[HYBRID] All schemes failed → Escalating to Chromium for {url}")
+            # Prefer the first candidate (or last known) for Playwright
+            proxy_for_browser = candidates[0] if candidates else None
+            html, final_url = await self._request_playwright(url, proxy_for_browser)
             if html:
-                if self.current_proxy:
-                    await self.scorer.record_result(self.current_proxy, True, time.time() - start)
+                elapsed = time.time() - start
+                scheme = proxy_for_browser.split("://")[0] if proxy_for_browser and "://" in proxy_for_browser else None
+                await self.scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
                 return html, final_url
 
         return None, url
