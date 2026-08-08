@@ -76,16 +76,19 @@ class HybridTransport:
         start = time.time()
 
         if not raw_proxy:
-            # No proxy available – try direct
+            print("[HYBRID] No proxy available → trying direct connection")
             html, final_url, _ = await self._request_curl_cffi(url, None)
             return html, final_url
 
         candidates = self.scorer.get_scheme_candidates(raw_proxy)
+        print(f"[HYBRID] Selected proxy: {raw_proxy}")
+        print(f"[HYBRID] Scheme candidates: {candidates}")
+
         last_should_escalate = True
 
         for proxy_url in candidates:
             scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
-            logger.debug(f"[HYBRID] Trying {scheme}:// for {raw_proxy}")
+            print(f"[HYBRID] → Trying scheme: {scheme.upper()}")
 
             html, final_url, should_escalate = await self._request_curl_cffi(url, proxy_url)
             last_should_escalate = should_escalate
@@ -94,23 +97,26 @@ class HybridTransport:
             elapsed = time.time() - start
 
             if success:
+                print(f"[HYBRID] ✅ SUCCESS with {scheme.upper()} (took {elapsed:.2f}s)")
                 await self.scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
                 return html, final_url
             else:
-                # Record partial fail for this attempt (still counts against the raw proxy)
+                print(f"[HYBRID] ❌ Failed with {scheme.upper()}")
                 await self.scorer.record_result(raw_proxy, False, elapsed)
 
         # All schemes failed with curl_cffi → escalate to BrowserEngine if needed
         if last_should_escalate:
-            logger.info(f"[HYBRID] All schemes failed → Escalating to Chromium for {url}")
-            # Prefer the first candidate (or last known) for Playwright
+            print(f"[HYBRID] All schemes failed → Escalating to Chromium BrowserEngine")
             proxy_for_browser = candidates[0] if candidates else None
             html, final_url = await self._request_playwright(url, proxy_for_browser)
             if html:
                 elapsed = time.time() - start
                 scheme = proxy_for_browser.split("://")[0] if proxy_for_browser and "://" in proxy_for_browser else None
+                print(f"[HYBRID] ✅ SUCCESS with BrowserEngine ({scheme})")
                 await self.scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
                 return html, final_url
+            else:
+                print("[HYBRID] ❌ BrowserEngine also failed")
 
         return None, url
 
