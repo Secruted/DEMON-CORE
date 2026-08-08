@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.1
+DΞMON CORE - HYBRID FEEDER v1.2
 ================================
 Escalation Matrix Feeder with advanced poison detection,
-ProxyScorer integration, stealth headers, and unified BrowserEngine (Chromium).
+ProxyScorer integration (centralized scheme candidates),
+stealth headers, and unified BrowserEngine (Chromium).
 
-Designed for constrained Ubuntu VPS environments.
+Scheme resolution (when no prefix): HTTP → SOCKS5 → SOCKS4
 """
 
 import os
@@ -40,7 +41,6 @@ BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_BROWSER_SESSIONS)
 logger = logging.getLogger("HYBRID_FEEDER")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Global scorer (shared with the rest of the system)
 scorer: Optional[ProxyScorer] = None
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,6 @@ POISON_DOM_SIGNATURES = [
 ]
 
 def is_poisoned(html: str, final_url: str = "") -> bool:
-    """Strict poison detection even on HTTP 200."""
     if not html:
         return True
 
@@ -119,7 +118,6 @@ def save_target(domain: str) -> bool:
 # Parsing with CSS + Regex fallback
 # ---------------------------------------------------------------------------
 def parse_google_results(html: str) -> List[str]:
-    """Extract clean domains. CSS first, Regex fallback."""
     domains: List[str] = []
 
     try:
@@ -150,7 +148,6 @@ def parse_google_results(html: str) -> List[str]:
     except Exception:
         pass
 
-    # Regex fallback
     try:
         pattern = r'/url\?q=(https?://[^&\s"\']+)'
         matches = re.findall(pattern, html)
@@ -174,7 +171,7 @@ async def humanized_delay(min_s: float = 2.8, max_s: float = 7.5):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 # ---------------------------------------------------------------------------
-# Tier 1 & Tier 2: curl_cffi
+# Tier 1 & Tier 2: curl_cffi with scheme candidates
 # ---------------------------------------------------------------------------
 async def fetch_with_curl(
     session: AsyncSession,
@@ -189,100 +186,92 @@ async def fetch_with_curl(
     url = f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}"
 
     headers = get_stealth_headers(mobile_bias=0.20)
-    proxy = await scorer.get_best_proxy()
-    formatted_proxy = None
-    if proxy:
-        formatted_proxy = proxy if "://" in proxy else f"http://{proxy}"
+    raw_proxy = await scorer.get_best_proxy()
 
+    if not raw_proxy:
+        # No proxy – try direct
+        try:
+            resp = await session.get(url, headers=headers, timeout=28, allow_redirects=True, impersonate=impersonate)
+            html = resp.text or ""
+            final_url = str(resp.url) if hasattr(resp, "url") else url
+            if resp.status_code == 200 and not is_poisoned(html, final_url):
+                return html, final_url, False
+            return None, final_url, True
+        except Exception:
+            return None, url, True
+
+    candidates = scorer.get_scheme_candidates(raw_proxy)
     start_time = time.time()
-    html = None
-    final_url = url
-    success = False
-    poisoned = False
 
-    try:
-        resp = await session.get(
-            url,
-            headers=headers,
-            proxy=formatted_proxy,
-            timeout=28,
-            allow_redirects=True,
-            impersonate=impersonate,
-        )
-        final_url = str(resp.url) if hasattr(resp, "url") else url
-        html = resp.text or ""
+    for proxy_url in candidates:
+        scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
+        logger.debug(f"[FEEDER] Trying scheme {scheme} for {raw_proxy}")
 
-        if resp.status_code == 200:
-            if is_poisoned(html, final_url):
-                poisoned = True
-                success = False
+        try:
+            resp = await session.get(
+                url,
+                headers=headers,
+                proxy=proxy_url,
+                timeout=28,
+                allow_redirects=True,
+                impersonate=impersonate,
+            )
+            final_url = str(resp.url) if hasattr(resp, "url") else url
+            html = resp.text or ""
+
+            if resp.status_code == 200:
+                if is_poisoned(html, final_url):
+                    await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                    continue
+                else:
+                    await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
+                    return html, final_url, False
             else:
-                success = True
-        else:
-            success = False
-            if resp.status_code in (403, 429, 503) or is_poisoned(html, final_url):
-                poisoned = True
+                await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                if resp.status_code in (403, 429, 503):
+                    continue
+        except Exception as e:
+            logger.debug(f"[curl] {scheme} failed: {e}")
+            await scorer.record_result(raw_proxy, False, time.time() - start_time)
 
-    except Exception as e:
-        logger.debug(f"[curl] Exception: {e}")
-        success = False
-
-    elapsed = time.time() - start_time
-    if proxy:
-        await scorer.record_result(
-            proxy=proxy,
-            success=success and not poisoned,
-            response_time=elapsed,
-        )
-
-    return (html if success else None), final_url, poisoned
+    return None, url, True
 
 # ---------------------------------------------------------------------------
 # Tier 3: Unified BrowserEngine (Chromium)
 # ---------------------------------------------------------------------------
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
-    """Tier 3 heavy engine using centralized BrowserEngine."""
     global scorer
 
     query = quote_plus(dork)
     url = f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}"
 
-    proxy = await scorer.get_best_proxy()
-    formatted_proxy = proxy if proxy and "://" in proxy else (f"http://{proxy}" if proxy else None)
+    raw_proxy = await scorer.get_best_proxy()
+    candidates = scorer.get_scheme_candidates(raw_proxy) if raw_proxy else [None]
 
     start_time = time.time()
-    html = None
-    final_url = url
-    success = False
-    poisoned = False
 
     async with BROWSER_SEMAPHORE:
-        async with BrowserEngine(proxy=formatted_proxy, block_resources=True) as engine:
-            if not engine.enabled:
-                logger.error("[TIER3] BrowserEngine failed to start")
-                return None, url, True
+        for proxy_url in candidates:
+            scheme = proxy_url.split("://")[0] if proxy_url and "://" in proxy_url else None
 
-            html, final_url = await engine.request(url)
+            try:
+                async with BrowserEngine(proxy=proxy_url, block_resources=True) as engine:
+                    if not engine.enabled:
+                        continue
 
-            if html:
-                if is_poisoned(html, final_url):
-                    poisoned = True
-                    success = False
-                else:
-                    success = True
-            else:
-                success = False
-                poisoned = True
+                    html, final_url = await engine.request(url)
 
-    elapsed = time.time() - start_time
-    if proxy:
-        await scorer.record_result(
-            proxy=proxy,
-            success=success and not poisoned,
-            response_time=elapsed,
-        )
+                    if html and not is_poisoned(html, final_url):
+                        await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
+                        return html, final_url, False
+                    else:
+                        await scorer.record_result(raw_proxy, False, time.time() - start_time)
+            except Exception as e:
+                logger.debug(f"[TIER3] {scheme} failed: {e}")
+                if raw_proxy:
+                    await scorer.record_result(raw_proxy, False, time.time() - start_time)
 
-    return (html if success else None), final_url, poisoned
+    return None, url, True
 
 # ---------------------------------------------------------------------------
 # Escalation Matrix for a single page
@@ -292,8 +281,6 @@ async def fetch_page_with_escalation(
     dork: str,
     start: int = 0,
 ) -> Optional[str]:
-    """Tier 1 → Tier 2 → Tier 3"""
-    # Tier 1
     logger.info(f"[TIER1] Ghost attack for dork start={start}")
     html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="chrome120")
     if html and not poisoned:
@@ -301,7 +288,6 @@ async def fetch_page_with_escalation(
 
     await humanized_delay(3.5, 6.5)
 
-    # Tier 2
     logger.info("[TIER2] Tactical re-attack with new identity")
     html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="edge99")
     if html and not poisoned:
@@ -309,7 +295,6 @@ async def fetch_page_with_escalation(
 
     await humanized_delay(4.0, 8.0)
 
-    # Tier 3
     logger.info("[TIER3] Escalating to unified Chromium BrowserEngine")
     html, final_url, poisoned = await fetch_with_playwright(dork, start)
     if html and not poisoned:
@@ -323,7 +308,7 @@ async def fetch_page_with_escalation(
 # ---------------------------------------------------------------------------
 async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> int:
     print(f"\n🚀 Executing Dork: {dork}")
-    print("   Hybrid Escalation Matrix active...")
+    print("   Hybrid Escalation Matrix + Scheme candidates active...")
 
     captured = 0
     start = 0
@@ -362,7 +347,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.1 (UNIFIED BROWSER ENGINE)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.2 (SCHEME CANDIDATES)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
 
