@@ -1,12 +1,9 @@
 """
-Browser Engine - Unified Chromium Stealth Engine (v2.1)
+Browser Engine - Unified Chromium Stealth Engine (v2.2)
 -------------------------------------------------------
 Centralized heavy escalation engine for the entire DEMON CORE system.
 
-Changes in v2.1:
-- close() performs graceful shutdown first
-- _force_kill() runs only if graceful cleanup failed
-- Force-kill focuses on tracked PIDs only (less aggressive)
+v2.2: Add masked proxy diagnostic before chromium.launch (no logic change)
 """
 
 import os
@@ -15,6 +12,25 @@ import asyncio
 from typing import Optional, Tuple, List
 
 logger = logging.getLogger("BROWSER_ENGINE")
+
+def _mask_proxy_parts(proxy: Optional[str]) -> str:
+    """Return masked scheme/host/port for diagnostics."""
+    if not proxy:
+        return "none"
+    try:
+        if "://" in proxy:
+            scheme, rest = proxy.split("://", 1)
+        else:
+            scheme, rest = "http", proxy
+        if ":" in rest:
+            host, port = rest.rsplit(":", 1)
+        else:
+            host, port = rest, "?"
+        if len(host) > 6:
+            host = host[:3] + "***" + host[-2:]
+        return f"scheme={scheme} host={host} port={port}"
+    except Exception:
+        return "unparseable"
 
 class BrowserEngine:
     """
@@ -87,6 +103,8 @@ class BrowserEngine:
             if self.proxy:
                 server = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
                 launch_args["proxy"] = {"server": server}
+                # Diagnostic only — no logic change
+                print(f"[BROWSER][PROXY] {_mask_proxy_parts(server)}")
 
             self.browser = await self.playwright.chromium.launch(**launch_args)
 
@@ -203,13 +221,10 @@ class BrowserEngine:
         except Exception:
             graceful_ok = False
 
-        # Only force-kill if graceful path failed or start previously failed
         if not graceful_ok or self._cleanup_failed:
-            # Small pause to let pipes settle
             await asyncio.sleep(0.3)
             await self._force_kill()
 
-        # Always try to stop virtual display
         if self.display:
             try:
                 self.display.stop()
@@ -229,7 +244,6 @@ class BrowserEngine:
             for pid in list(self._pids):
                 try:
                     p = psutil.Process(pid)
-                    # Kill children of this specific process first
                     for child in p.children(recursive=True):
                         try:
                             child.kill()
