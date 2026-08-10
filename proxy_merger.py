@@ -3,14 +3,14 @@
 DΞMON CORE - Proxy Merger
 =========================
 Collects proxies from all .txt files in the current directory,
-normalizes them (adds http:// if missing), deduplicates,
-and writes the clean list to proxy.txt.
+cleans them, deduplicates, and writes the clean list to proxy.txt.
 
-Proxy type detection (HTTP / SOCKS4 / SOCKS5) is left to the
-runtime system (ProxyScorer / transport) when the proxy is actually tested.
+IMPORTANT:
+- Does NOT force any scheme (http/socks).
+- Preserves the original format exactly.
+- Scheme resolution is the responsibility of ProxyScorer / runtime.
 """
 
-import os
 from pathlib import Path
 from typing import Set, List
 
@@ -39,21 +39,20 @@ def is_proxy_like(line: str) -> bool:
     line = line.strip()
     if not line or line.startswith("#"):
         return False
-    # Very loose check – we accept almost anything that has a colon
     return ":" in line and len(line) >= 7
 
 
 def normalize_proxy(line: str) -> str:
-    """Add http:// if no scheme is present."""
-    line = line.strip()
-    if "://" not in line:
-        return f"http://{line}"
-    return line
+    """
+    Only clean whitespace. Do NOT add or change any scheme.
+    Preserve original format exactly.
+    """
+    return line.strip()
 
 
 def collect_proxies(directory: Path = None) -> tuple[Set[str], List[str]]:
     """
-    Scan directory for .txt files, collect and normalize proxies.
+    Scan directory for .txt files, collect and clean proxies.
     Returns (unique_proxies, processed_files)
     """
     if directory is None:
@@ -75,8 +74,8 @@ def collect_proxies(directory: Path = None) -> tuple[Set[str], List[str]]:
             count_before = len(unique)
             for raw in lines:
                 if is_proxy_like(raw):
-                    normalized = normalize_proxy(raw)
-                    unique.add(normalized)
+                    cleaned = normalize_proxy(raw)
+                    unique.add(cleaned)
 
             added = len(unique) - count_before
             processed_files.append(f"{name} (+{added})")
@@ -101,6 +100,7 @@ def main():
     print("\n🕷️  DΞMON CORE – Proxy Merger")
     print("--------------------------------")
     print("Scanning current directory for proxy lists...\n")
+    print("NOTE: Original schemes are preserved. No http:// is forced.\n")
 
     unique_proxies, processed = collect_proxies()
 
@@ -118,7 +118,7 @@ def main():
     print(f"Unique proxies  : {total}")
     print(f"Output written  : {PROXY_FILE}")
     print("\n✅ Done. proxy.txt is ready for the system.")
-    print("   Proxy type (HTTP/SOCKS) will be detected at runtime by ProxyScorer / transport.")
+    print("   Scheme resolution is handled at runtime by ProxyScorer.")
 
 
 if __name__ == "__main__":
