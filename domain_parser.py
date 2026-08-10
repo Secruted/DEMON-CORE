@@ -6,17 +6,18 @@ import logging
 import time
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
-from proxy_manager import ProxyManager
+from proxy_compat import ProxyCompat
 
 class DomainParser:
-    def __init__(self, proxy_manager: ProxyManager):
+    def __init__(self, proxy_manager: ProxyCompat = None):
         """
-        Initializes the domain parser with advanced OSINT capabilities, using an external ProxyManager.
-        :param proxy_manager: An instance of the enhanced ProxyManager.
+        Initializes the domain parser with advanced OSINT capabilities.
+        Uses ProxyCompat (thin layer over ProxyScorer) instead of the old ProxyManager.
+        :param proxy_manager: An instance of ProxyCompat (or compatible object).
         """
         self.logger = logging.getLogger(__name__)
         self.session = requests.Session()
-        self.proxy_manager = proxy_manager
+        self.proxy_manager = proxy_manager or ProxyCompat()
         self.dir_listing_pattern = re.compile(r"Index of|Listing of|Directory listing for", re.IGNORECASE)
         
         self.default_headers = {
@@ -38,7 +39,7 @@ class DomainParser:
         """
         user_agent = self.proxy_manager.get_random_user_agent()
         if not user_agent:
-            self.logger.warning("No User-Agent available from ProxyManager. Using fallback.")
+            self.logger.warning("No User-Agent available. Using fallback.")
             user_agent = random.choice(self.proxy_manager.user_agents)
 
         headers = self.default_headers.copy()
