@@ -1,33 +1,24 @@
 """
-Browser Engine - Unified Chromium Stealth Engine (v2.0)
+Browser Engine - Unified Chromium Stealth Engine (v2.1)
 -------------------------------------------------------
 Centralized heavy escalation engine for the entire DEMON CORE system.
 
-Features:
-- Chromium only (fingerprint unification with curl_cffi chrome*)
-- Automatic Xvfb via pyvirtualdisplay on headless Linux VPS
-- Ruthless process-tree annihilation with psutil (SIGKILL)
-- Resource hardening (block images, fonts, media)
-- Deep stealth injection via CDP + init scripts
-- Async context manager for guaranteed cleanup
-- Concurrency control via external Semaphore (caller responsibility)
-
-Usage:
-    async with BrowserEngine(proxy="http://ip:port") as engine:
-        html, final_url = await engine.request(url)
+Changes in v2.1:
+- close() performs graceful shutdown first
+- _force_kill() runs only if graceful cleanup failed
+- Force-kill focuses on tracked PIDs only (less aggressive)
 """
 
 import os
 import logging
 import asyncio
-from contextlib import asynccontextmanager
 from typing import Optional, Tuple, List
 
 logger = logging.getLogger("BROWSER_ENGINE")
 
 class BrowserEngine:
     """
-    Unified Chromium engine with force-kill and virtual display.
+    Unified Chromium engine with controlled force-kill and virtual display.
     Designed for constrained Ubuntu VPS environments.
     """
 
@@ -47,6 +38,7 @@ class BrowserEngine:
         self.display = None
         self.enabled = False
         self._pids: List[int] = []
+        self._cleanup_failed = False
 
     async def __aenter__(self):
         await self.start()
@@ -120,29 +112,16 @@ class BrowserEngine:
 
             # Deep stealth injection
             await self.context.add_init_script("""
-                // Webdriver
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-
-                // Chrome runtime
                 window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-
-                // Plugins & languages
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-
-                // Permissions
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = (parameters) => (
                     parameters.name === 'notifications' ?
                         Promise.resolve({ state: Notification.permission }) :
                         originalQuery(parameters)
                 );
-
-                // WebGL vendor spoof (basic)
                 const getParameter = WebGLRenderingContext.prototype.getParameter;
                 WebGLRenderingContext.prototype.getParameter = function(parameter) {
                     if (parameter === 37445) return 'Intel Inc.';
@@ -157,9 +136,11 @@ class BrowserEngine:
         except ImportError as e:
             logger.error(f"[BROWSER] Missing dependency: {e}")
             self.enabled = False
+            self._cleanup_failed = True
         except Exception as e:
             logger.error(f"[BROWSER] Failed to start engine: {e}")
             self.enabled = False
+            self._cleanup_failed = True
             await self._force_kill()
 
     async def request(self, url: str, timeout: int = 35000) -> Tuple[Optional[str], str]:
@@ -201,29 +182,34 @@ class BrowserEngine:
                     pass
 
     async def close(self):
-        """Graceful close + ruthless force-kill of any remaining processes."""
+        """Graceful close first. Force-kill only if cleanup failed."""
+        graceful_ok = True
+
         try:
             if self.context:
                 await self.context.close()
         except Exception:
-            pass
+            graceful_ok = False
 
         try:
             if self.browser:
                 await self.browser.close()
         except Exception:
-            pass
+            graceful_ok = False
 
         try:
             if self.playwright:
                 await self.playwright.stop()
         except Exception:
-            pass
+            graceful_ok = False
 
-        # Ruthless process tree annihilation
-        await self._force_kill()
+        # Only force-kill if graceful path failed or start previously failed
+        if not graceful_ok or self._cleanup_failed:
+            # Small pause to let pipes settle
+            await asyncio.sleep(0.3)
+            await self._force_kill()
 
-        # Stop virtual display
+        # Always try to stop virtual display
         if self.display:
             try:
                 self.display.stop()
@@ -232,31 +218,29 @@ class BrowserEngine:
             self.display = None
 
         self.enabled = False
-        logger.info("[BROWSER] Engine closed and process tree cleaned")
+        self._cleanup_failed = False
+        logger.info("[BROWSER] Engine closed")
 
     async def _force_kill(self):
-        """Kill entire Chromium process tree using psutil."""
+        """Kill only the PIDs we tracked. Avoid aggressive recursive killing."""
         try:
             import psutil
-            current = psutil.Process()
-            children = current.children(recursive=True)
 
-            for child in children:
-                try:
-                    name = child.name().lower()
-                    if "chrom" in name or "playwright" in name:
-                        logger.debug(f"[BROWSER] Force-killing PID {child.pid} ({name})")
-                        child.kill()  # SIGKILL
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-
-            # Also try any tracked PIDs
-            for pid in self._pids:
+            for pid in list(self._pids):
                 try:
                     p = psutil.Process(pid)
+                    # Kill children of this specific process first
+                    for child in p.children(recursive=True):
+                        try:
+                            child.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
                     p.kill()
-                except Exception:
+                    logger.debug(f"[BROWSER] Force-killed tracked PID {pid}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+                except Exception as e:
+                    logger.debug(f"[BROWSER] Force-kill error on {pid}: {e}")
 
             self._pids.clear()
 
