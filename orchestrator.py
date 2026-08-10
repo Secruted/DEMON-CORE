@@ -51,10 +51,13 @@ async def main():
 
     try:
         master_pwd = getpass.getpass(prompt="Enter Master Password: ")
-    except:
+    except Exception:
         master_pwd = "123"
 
     print(f"\n{C_GREEN}SYSTEM ONLINE - HYBRID MODE (curl_cffi → Playwright){C_RESET}\n")
+
+    db = None
+    transport = None
 
     try:
         db = DBManager("watcher.db", master_pwd)
@@ -72,13 +75,24 @@ async def main():
 
         await harvester.start_mission()
 
-        await db.close()
-        await transport.close()
         logger.info("=== MISSION COMPLETE ===")
 
     except Exception as e:
-        logger.critical(f"Fatal: {e}", exp_info=True)
+        logger.critical(f"Fatal: {e}", exc_info=True)
         sys.exit(1)
+
+    finally:
+        # Guaranteed cleanup
+        if transport:
+            try:
+                await transport.close()
+            except Exception:
+                pass
+        if db:
+            try:
+                await db.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     try:
