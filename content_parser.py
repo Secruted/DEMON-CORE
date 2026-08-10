@@ -6,8 +6,6 @@ from bs4 import BeautifulSoup
 from bip39_validator import verify_bip39_checksum
 from statuses import Status
 
-# ULTRA 911 ARCHITECTURE: ASYNC CONTENT PARSER
-
 class ContentParser:
     def __init__(self, intel_cfg, transport_mgr):
         self.logger = logging.getLogger("PARSER")
@@ -22,7 +20,7 @@ class ContentParser:
         }
 
         self.gold_keys = {
-            'password', 'passwd', 'secret', 'token', 'access_token', 'api_key', 
+            'password', 'passwd', 'secret', 'token', 'access_token', 'api_key',
             'mnemonic', 'seed', 'private_key', 'balance', 'wallet', 'credential'
         }
 
@@ -34,16 +32,19 @@ class ContentParser:
             self.bip39_wordlist, self.bip39_set = [], set()
 
     async def process_url(self, url):
-        """
-        [ASYNC ENGINE] Non-blocking fetch and parse.
-        """
+        self.logger.debug(f"[PARSER] FETCH START | {url}")
+
         html, final_url = await self.transport.request(url)
 
         if not html:
+            self.logger.debug(f"[PARSER] FETCH FAILED | {url}")
             return Status.FAILED_FETCH, []
+
+        self.logger.debug(f"[PARSER] FETCH SUCCESS | {url}")
 
         stripped = html.strip()
         if stripped and stripped[0] in ('{', '['):
+            self.logger.debug(f"[PARSER] JSON MODE | {url}")
             return self._engage_json_mode(html)
 
         if "google.com" in url or "github.com/search" in url:
@@ -51,7 +52,7 @@ class ContentParser:
             return Status.ROUTER_SIGNAL, leads
 
         soup = BeautifulSoup(html, "html.parser")
-        for junk in soup(["script", "style", "nav", "footer"]): 
+        for junk in soup(["script", "style", "nav", "footer"]):
             junk.decompose()
         text = soup.get_text(separator=" ", strip=True)
 
@@ -59,7 +60,10 @@ class ContentParser:
             return Status.SKIPPED_LOW_ENTROPY, []
 
         findings = self.extract_valuable_info(text)
-        return (Status.HARVEST_SUCCESS, findings) if findings else (Status.SKIPPED_NO_TECH_SIGNALS, [])
+        if findings:
+            self.logger.debug(f"[PARSER] SIGNALS FOUND | {url} | count={len(findings)}")
+            return Status.HARVEST_SUCCESS, findings
+        return Status.SKIPPED_NO_TECH_SIGNALS, []
 
     def _engage_json_mode(self, raw_json):
         try:
@@ -85,13 +89,16 @@ class ContentParser:
             self._scan_text_segment(data, findings)
 
     def _scan_text_segment(self, text, findings):
-        if len(text) > 5000: return 
+        if len(text) > 5000:
+            return
         for p_type, compiled_p in self.patterns.items():
             match = compiled_p.search(text)
             if match:
                 val = match.group(0).strip()
-                if val in self.seen_assets: continue
-                if p_type == "CRYPTO_SEED" and not self._validate_seed(val): continue
+                if val in self.seen_assets:
+                    continue
+                if p_type == "CRYPTO_SEED" and not self._validate_seed(val):
+                    continue
                 findings.append((p_type, val))
                 self.seen_assets.add(val)
 
@@ -110,11 +117,12 @@ class ContentParser:
         if len(self.seen_assets) > self.max_seen_limit:
             self.seen_assets.clear()
         found = []
-        self._scan_text_segment(text, found) 
+        self._scan_text_segment(text, found)
         return found
 
     def _get_hungry_score(self, text):
-        if not text or len(text) < 50: return 0
+        if not text or len(text) < 50:
+            return 0
         symbols = len(re.findall(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]', text)) / len(text)
         keywords = ['env', 'key', 'token', 'mnemonic', 'secret', 'sk-', 'ghp_']
         score = (40 if symbols > 0.05 else 0) + (40 if any(k in text.lower() for k in keywords) else 0)
@@ -122,6 +130,8 @@ class ContentParser:
 
     def _validate_seed(self, phrase):
         words = phrase.lower().split()
-        if len(words) not in {12, 15, 18, 21, 24}: return False
-        if not all(w in self.bip39_set for w in words): return False
+        if len(words) not in {12, 15, 18, 21, 24}:
+            return False
+        if not all(w in self.bip39_set for w in words):
+            return False
         return verify_bip39_checksum(phrase, self.bip39_wordlist)
