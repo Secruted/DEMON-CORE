@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.2
+DΞMON CORE - HYBRID FEEDER v1.3
 ================================
 Escalation Matrix Feeder with advanced poison detection,
 ProxyScorer integration (centralized scheme candidates),
 stealth headers, and unified BrowserEngine (Chromium).
 
-Scheme resolution (when no prefix): HTTP → SOCKS5 → SOCKS4
+v1.3: Reduce BrowserEngine churn — one engine per Tier-3 attempt
+using the preferred scheme candidate only.
 """
 
 import os
@@ -189,7 +190,6 @@ async def fetch_with_curl(
     raw_proxy = await scorer.get_best_proxy()
 
     if not raw_proxy:
-        # No proxy – try direct
         try:
             resp = await session.get(url, headers=headers, timeout=28, allow_redirects=True, impersonate=impersonate)
             html = resp.text or ""
@@ -237,9 +237,14 @@ async def fetch_with_curl(
     return None, url, True
 
 # ---------------------------------------------------------------------------
-# Tier 3: Unified BrowserEngine (Chromium)
+# Tier 3: Unified BrowserEngine (Chromium) — one engine per attempt
 # ---------------------------------------------------------------------------
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
+    """
+    Tier 3 heavy engine.
+    Uses only the preferred scheme candidate (first from get_scheme_candidates)
+    to avoid creating/destroying Chromium for every scheme.
+    """
     global scorer
 
     query = quote_plus(dork)
@@ -248,28 +253,34 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
     raw_proxy = await scorer.get_best_proxy()
     candidates = scorer.get_scheme_candidates(raw_proxy) if raw_proxy else [None]
 
+    # Prefer the first candidate only (already ordered by last_successful_scheme or default)
+    preferred = candidates[0] if candidates else None
+    scheme = preferred.split("://")[0] if preferred and "://" in preferred else None
+
     start_time = time.time()
 
     async with BROWSER_SEMAPHORE:
-        for proxy_url in candidates:
-            scheme = proxy_url.split("://")[0] if proxy_url and "://" in proxy_url else None
-
-            try:
-                async with BrowserEngine(proxy=proxy_url, block_resources=True) as engine:
-                    if not engine.enabled:
-                        continue
-
-                    html, final_url = await engine.request(url)
-
-                    if html and not is_poisoned(html, final_url):
-                        await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
-                        return html, final_url, False
-                    else:
+        try:
+            async with BrowserEngine(proxy=preferred, block_resources=True) as engine:
+                if not engine.enabled:
+                    logger.error("[TIER3] BrowserEngine failed to start")
+                    if raw_proxy:
                         await scorer.record_result(raw_proxy, False, time.time() - start_time)
-            except Exception as e:
-                logger.debug(f"[TIER3] {scheme} failed: {e}")
-                if raw_proxy:
+                    return None, url, True
+
+                html, final_url = await engine.request(url)
+
+                if html and not is_poisoned(html, final_url):
+                    await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
+                    return html, final_url, False
+                else:
                     await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                    return None, final_url, True
+
+        except Exception as e:
+            logger.debug(f"[TIER3] failed: {e}")
+            if raw_proxy:
+                await scorer.record_result(raw_proxy, False, time.time() - start_time)
 
     return None, url, True
 
@@ -295,7 +306,7 @@ async def fetch_page_with_escalation(
 
     await humanized_delay(4.0, 8.0)
 
-    logger.info("[TIER3] Escalating to unified Chromium BrowserEngine")
+    logger.info("[TIER3] Escalating to unified Chromium BrowserEngine (preferred scheme only)")
     html, final_url, poisoned = await fetch_with_playwright(dork, start)
     if html and not poisoned:
         return html
@@ -347,7 +358,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.2 (SCHEME CANDIDATES)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.3 (REDUCED BROWSER CHURN)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
 
