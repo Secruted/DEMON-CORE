@@ -1,8 +1,6 @@
-import time
 import logging
 import asyncio
 from datetime import datetime
-from pathlib import Path
 
 from router import Router
 from statuses import Status
@@ -22,7 +20,11 @@ class Harvester:
         self.router = Router("targets.txt")
         self.target_warnings = {}
         self.CONCURRENCY_LIMIT = 300
+        self.QUEUE_MAXSIZE = 2000          # Bounded queue to avoid memory explosion
+
         self.failed_count = 0
+        self.completed_count = 0
+        self.hit_count = 0
 
     def _timestamp(self):
         return datetime.now().strftime("%H:%M:%S")
@@ -34,6 +36,7 @@ class Harvester:
                 domain = self._extract_domain(url)
                 if self.target_warnings.get(domain, 0) < 3:
                     await self._execute_strike(url, domain)
+                self.completed_count += 1
             except Exception as e:
                 self.failed_count += 1
                 self.logger.error(
@@ -43,28 +46,36 @@ class Harvester:
                 queue.task_done()
 
     async def start_mission(self):
-        total_targets = self.router.get_route_count()
-        if total_targets == 0:
+        total_routes = self.router.get_route_count()
+        total_targets = len(self.router.targets)
+
+        if total_routes == 0:
             print(f"{self._timestamp()} | {C_YELLOW}WARNING{C_RESET} | No targets found.")
             return
 
-        print(f"{self._timestamp()} | {C_RED}HYBRID ENGINE{C_RESET} | Starting swarm ({self.CONCURRENCY_LIMIT} workers)...")
+        print(f"{self._timestamp()} | {C_RED}HYBRID ENGINE{C_RESET} | Targets: {total_targets} | Routes planned: {total_routes}")
+        print(f"{self._timestamp()} | {C_RED}HYBRID ENGINE{C_RESET} | Starting swarm ({self.CONCURRENCY_LIMIT} workers, queue max {self.QUEUE_MAXSIZE})...")
 
-        # Initialize hybrid transport (idempotent)
         if hasattr(self.transport, "init"):
             await self.transport.init()
         elif hasattr(self.transport, "init_session"):
             await self.transport.init_session()
 
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=self.QUEUE_MAXSIZE)
+
         workers = [
             asyncio.create_task(self._worker(queue, i))
             for i in range(self.CONCURRENCY_LIMIT)
         ]
 
-        for url in self.router.generator():
-            await queue.put(url)
+        # Producer with backpressure
+        async def producer():
+            for url in self.router.generator():
+                await queue.put(url)
 
+        producer_task = asyncio.create_task(producer())
+
+        await producer_task
         await queue.join()
 
         for w in workers:
@@ -75,12 +86,14 @@ class Harvester:
         elif hasattr(self.transport, "close_session"):
             await self.transport.close_session()
 
-        print(f"{self._timestamp()} | {C_BLUE}INFO{C_RESET} | Mission complete. Failed strikes: {self.failed_count}")
+        print(f"{self._timestamp()} | {C_BLUE}INFO{C_RESET} | Mission complete.")
+        print(f"             Completed: {self.completed_count} | Hits: {self.hit_count} | Failed: {self.failed_count}")
 
     async def _execute_strike(self, url, domain):
         status, findings = await self.parser.process_url(url)
 
         if status == Status.HARVEST_SUCCESS:
+            self.hit_count += 1
             print(f"{self._timestamp()} | {C_GREEN}HIT{C_RESET} | {url}")
             for item_type, value in findings:
                 val_short = value[:50] + "..." if len(value) > 50 else value
