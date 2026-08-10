@@ -150,7 +150,7 @@ def save_target(domain: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Parsing with CSS + Regex fallback + DIAG counters
+# Parsing with CSS + Regex fallback + DETAILED DIAG (no logic change)
 # ---------------------------------------------------------------------------
 def parse_google_results(html: str) -> List[str]:
     domains: List[str] = []
@@ -159,6 +159,42 @@ def parse_google_results(html: str) -> List[str]:
     regex_candidates = 0
     regex_valid = 0
 
+    # --- DIAGNOSTIC ONLY (does not change extraction) ---
+    try:
+        soup_diag = BeautifulSoup(html, "lxml")
+        all_anchors = soup_diag.find_all("a", href=True)
+        total_a = len(all_anchors)
+
+        print(f"[DIAG][HTML] input_bytes={len(html)} total <a> tags={total_a}")
+
+        # Marker presence
+        has_yurubf = "yuRUbf" in html
+        has_url_q = "/url?q=" in html
+        has_data_ved = "data-ved" in html
+        print(f"[DIAG][HTML] yuRUbf={'yes' if has_yurubf else 'no'}  /url?q={'yes' if has_url_q else 'no'}  data-ved={'yes' if has_data_ved else 'no'}")
+
+        # Sample first 8 hrefs (raw)
+        samples = []
+        for a in all_anchors[:30]:
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith("#") or href.startswith("javascript:"):
+                continue
+            samples.append(href)
+            if len(samples) >= 8:
+                break
+
+        for i, s in enumerate(samples, 1):
+            # Truncate long samples for readability
+            shown = s if len(s) <= 120 else s[:117] + "..."
+            print(f"[DIAG][LINK] sample {i} = {shown}")
+
+        if not samples:
+            print("[DIAG][LINK] no usable href samples found")
+
+    except Exception as e:
+        print(f"[DIAG][HTML] diagnostic failed: {type(e).__name__}: {e}")
+
+    # --- ORIGINAL EXTRACTION LOGIC (unchanged) ---
     try:
         soup = BeautifulSoup(html, "lxml")
 
