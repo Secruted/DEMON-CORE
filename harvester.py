@@ -21,20 +21,24 @@ class Harvester:
 
         self.router = Router("targets.txt")
         self.target_warnings = {}
-        self.CONCURRENCY_LIMIT = 300   # Slightly reduced for hybrid stability
+        self.CONCURRENCY_LIMIT = 300
+        self.failed_count = 0
 
     def _timestamp(self):
         return datetime.now().strftime("%H:%M:%S")
 
-    async def _worker(self, queue):
+    async def _worker(self, queue, worker_id: int):
         while True:
             url = await queue.get()
             try:
                 domain = self._extract_domain(url)
                 if self.target_warnings.get(domain, 0) < 3:
                     await self._execute_strike(url, domain)
-            except Exception:
-                pass
+            except Exception as e:
+                self.failed_count += 1
+                self.logger.error(
+                    f"[WORKER {worker_id}] ERROR | target={url} | exception={type(e).__name__}: {e}"
+                )
             finally:
                 queue.task_done()
 
@@ -46,14 +50,17 @@ class Harvester:
 
         print(f"{self._timestamp()} | {C_RED}HYBRID ENGINE{C_RESET} | Starting swarm ({self.CONCURRENCY_LIMIT} workers)...")
 
-        # Initialize hybrid transport
+        # Initialize hybrid transport (idempotent)
         if hasattr(self.transport, "init"):
             await self.transport.init()
         elif hasattr(self.transport, "init_session"):
             await self.transport.init_session()
 
         queue = asyncio.Queue()
-        workers = [asyncio.create_task(self._worker(queue)) for _ in range(self.CONCURRENCY_LIMIT)]
+        workers = [
+            asyncio.create_task(self._worker(queue, i))
+            for i in range(self.CONCURRENCY_LIMIT)
+        ]
 
         for url in self.router.generator():
             await queue.put(url)
@@ -68,7 +75,7 @@ class Harvester:
         elif hasattr(self.transport, "close_session"):
             await self.transport.close_session()
 
-        print(f"{self._timestamp()} | {C_BLUE}INFO{C_RESET} | Mission complete.")
+        print(f"{self._timestamp()} | {C_BLUE}INFO{C_RESET} | Mission complete. Failed strikes: {self.failed_count}")
 
     async def _execute_strike(self, url, domain):
         status, findings = await self.parser.process_url(url)
@@ -94,5 +101,5 @@ class Harvester:
     def _extract_domain(self, url):
         try:
             return url.split("/")[2]
-        except:
+        except Exception:
             return "unknown"
