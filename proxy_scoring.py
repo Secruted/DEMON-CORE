@@ -4,7 +4,7 @@ import asyncio
 import logging
 import random
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from enum import Enum
 
@@ -15,6 +15,11 @@ class ProxyType(Enum):
     DATACENTER = "datacenter"
     RESIDENTIAL = "residential"
     MOBILE = "mobile"
+
+@dataclass
+class SchemeStats:
+    success: int = 0
+    fail: int = 0
 
 @dataclass
 class ProxyStats:
@@ -29,7 +34,9 @@ class ProxyStats:
     consecutive_fails: int = 0
     is_alive: bool = True
     banned_until: float = 0.0
-    last_successful_scheme: Optional[str] = None  # e.g. "http", "socks5", "socks4"
+    last_successful_scheme: Optional[str] = None
+    # Per-scheme lightweight stats (scheme-aware)
+    schemes: Dict[str, SchemeStats] = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float:
@@ -75,10 +82,10 @@ class ProxyScorer:
     """
     Advanced Proxy Scoring & Management System
     - Tracks success/fail/response time
-    - Calculates dynamic score
+    - Scheme-aware stats (HTTP / SOCKS5 / SOCKS4)
     - Smart selection of best proxies
-    - Auto-ban on repeated failures
-    - Centralized scheme candidates (HTTP → SOCKS5 → SOCKS4)
+    - Auto-ban on repeated hard failures
+    - Centralized scheme candidates
     """
 
     def __init__(self, proxy_file: str = "proxy.txt", state_file: str = "proxy_scores.json"):
@@ -88,7 +95,7 @@ class ProxyScorer:
         self.lock = asyncio.Lock()
 
         self.MIN_SCORE_TO_USE = 25.0
-        self.BAN_THRESHOLD = 5
+        self.BAN_THRESHOLD = 8          # Raised slightly because scheme probing produces more fails
         self.BAN_DURATION = 60 * 15
 
         self._load_proxies()
@@ -126,6 +133,13 @@ class ProxyScorer:
                     p.banned_until = stats.get("banned_until", 0.0)
                     p.proxy_type = ProxyType(stats.get("proxy_type", "unknown"))
                     p.last_successful_scheme = stats.get("last_successful_scheme")
+                    # Restore per-scheme stats if present
+                    schemes_data = stats.get("schemes", {})
+                    for sch, sdata in schemes_data.items():
+                        p.schemes[sch] = SchemeStats(
+                            success=sdata.get("success", 0),
+                            fail=sdata.get("fail", 0)
+                        )
             logger.info("[SCORER] Previous scores restored")
         except Exception as e:
             logger.warning(f"[SCORER] Could not load state: {e}")
@@ -134,6 +148,10 @@ class ProxyScorer:
         async with self.lock:
             data = {}
             for proxy, stats in self.proxies.items():
+                schemes_out = {
+                    sch: {"success": s.success, "fail": s.fail}
+                    for sch, s in stats.schemes.items()
+                }
                 data[proxy] = {
                     "success": stats.success,
                     "fail": stats.fail,
@@ -144,18 +162,33 @@ class ProxyScorer:
                     "banned_until": stats.banned_until,
                     "proxy_type": stats.proxy_type.value,
                     "last_successful_scheme": stats.last_successful_scheme,
+                    "schemes": schemes_out,
                 }
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
 
     async def record_result(self, proxy: str, success: bool, response_time: float = 0.0, scheme: Optional[str] = None):
-        """Called after every request. Optionally record the successful scheme."""
+        """
+        Record result with scheme awareness.
+        - Success always resets consecutive_fails and records the scheme.
+        - Failure increments overall fail, but per-scheme stats are tracked separately.
+        - Ban only after sustained hard failures (higher threshold).
+        """
         async with self.lock:
             if proxy not in self.proxies:
                 self.proxies[proxy] = ProxyStats(proxy=proxy)
 
             stats = self.proxies[proxy]
             stats.last_used = time.time()
+
+            # Update per-scheme stats
+            if scheme:
+                if scheme not in stats.schemes:
+                    stats.schemes[scheme] = SchemeStats()
+                if success:
+                    stats.schemes[scheme].success += 1
+                else:
+                    stats.schemes[scheme].fail += 1
 
             if success:
                 stats.success += 1
@@ -176,7 +209,6 @@ class ProxyScorer:
             stats.calculate_score()
 
     async def get_best_proxy(self) -> Optional[str]:
-        """Returns the highest scoring available raw proxy string."""
         async with self.lock:
             now = time.time()
             candidates = []
@@ -197,31 +229,28 @@ class ProxyScorer:
             return chosen.proxy
 
     def get_scheme_candidates(self, raw_proxy: str) -> List[str]:
-        """
-        Centralized scheme resolution.
-        Returns ordered list of proxy URLs to try.
-
-        Priority:
-        1. If raw_proxy already has a scheme → return it only.
-        2. If we previously succeeded with a scheme → try that first, then the others.
-        3. Otherwise default order: http → socks5 → socks4
-        """
         if not raw_proxy:
             return []
 
         if "://" in raw_proxy:
             return [raw_proxy]
 
-        # Clean possible leftover scheme-less string
         clean = raw_proxy.strip()
-
-        # Prefer last known successful scheme if available
         stats = self.proxies.get(raw_proxy)
-        preferred = None
-        if stats and stats.last_successful_scheme:
-            preferred = stats.last_successful_scheme
+        preferred = stats.last_successful_scheme if stats else None
 
-        order = []
+        # Prefer schemes that have historically succeeded for this proxy
+        if stats and stats.schemes:
+            ranked = sorted(
+                stats.schemes.items(),
+                key=lambda x: (x[1].success - x[1].fail, x[1].success),
+                reverse=True
+            )
+            good_schemes = [s for s, st in ranked if st.success > 0]
+            if good_schemes:
+                order = good_schemes + [s for s in ["http", "socks5", "socks4"] if s not in good_schemes]
+                return [f"{scheme}://{clean}" for scheme in order]
+
         if preferred == "http":
             order = ["http", "socks5", "socks4"]
         elif preferred == "socks5":
