@@ -1,9 +1,8 @@
 """
-Browser Engine - Unified Chromium Stealth Engine (v2.2)
+Browser Engine - Unified Chromium Stealth Engine (v2.3)
 -------------------------------------------------------
-Centralized heavy escalation engine for the entire DEMON CORE system.
-
-v2.2: Add masked proxy diagnostic before chromium.launch (no logic change)
+v2.3: Surface precise Playwright/Chromium error messages (net::ERR_*)
+in [DIAG][BROWSER] when page.goto fails.
 """
 
 import os
@@ -66,7 +65,6 @@ class BrowserEngine:
     async def start(self):
         """Launch Chromium with full hardening and virtual display if needed."""
         try:
-            # --- Automatic virtual display on headless Linux ---
             if os.name == "posix" and not os.environ.get("DISPLAY"):
                 try:
                     from pyvirtualdisplay import Display
@@ -103,12 +101,10 @@ class BrowserEngine:
             if self.proxy:
                 server = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
                 launch_args["proxy"] = {"server": server}
-                # Diagnostic only — no logic change
                 print(f"[BROWSER][PROXY] {_mask_proxy_parts(server)}")
 
             self.browser = await self.playwright.chromium.launch(**launch_args)
 
-            # Track browser process PID if available
             try:
                 if hasattr(self.browser, "process") and self.browser.process:
                     self._pids.append(self.browser.process.pid)
@@ -128,7 +124,6 @@ class BrowserEngine:
                 ignore_https_errors=True,
             )
 
-            # Deep stealth injection
             await self.context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
@@ -187,10 +182,17 @@ class BrowserEngine:
                 final_url = page.url
                 return content, final_url
             else:
+                status = response.status if response else "none"
+                print(f"[DIAG][BROWSER] goto completed but non-200 status={status} url={url[:80]}")
                 return None, url
 
         except Exception as e:
-            logger.debug(f"[BROWSER] Request failed for {url}: {e}")
+            # Surface precise Chromium / Playwright root cause (net::ERR_*, timeout, etc.)
+            err_type = type(e).__name__
+            err_msg = str(e)
+            # Playwright often embeds net::ERR_* inside the message
+            print(f"[DIAG][BROWSER] goto FAILED type={err_type} detail={err_msg}")
+            logger.warning(f"[BROWSER] Request failed for {url}: {err_type}: {err_msg}")
             return None, url
         finally:
             if page:
