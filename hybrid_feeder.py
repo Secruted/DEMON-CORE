@@ -3,7 +3,7 @@
 DΞMON CORE - HYBRID FEEDER v1.9
 ================================
 - Parallel scheme race (HTTP/SOCKS4/SOCKS5) with FIRST_COMPLETED
-- Fast-fail probe timeout 5s
+- Fast-fail probe timeout 10s
 - Winner takes all; losers cancelled immediately
 - Acquisition only; extraction via SearchProvider
 """
@@ -33,8 +33,8 @@ MAX_BROWSER_SESSIONS = int(os.getenv("MAX_BROWSER_SESSIONS", "1"))
 BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_BROWSER_SESSIONS)
 SEARCH_PROVIDER_NAME = os.getenv("SEARCH_PROVIDER", "google")
 
-# Fast-fail: handshake / scheme probe only (not full page budget)
-SCHEME_PROBE_TIMEOUT = float(os.getenv("SCHEME_PROBE_TIMEOUT", "5"))
+# Fast-fail: handshake / scheme probe (parallel race)
+SCHEME_PROBE_TIMEOUT = float(os.getenv("SCHEME_PROBE_TIMEOUT", "10"))
 # Full fetch timeout after scheme is known
 FETCH_TIMEOUT = float(os.getenv("FETCH_TIMEOUT", "20"))
 
