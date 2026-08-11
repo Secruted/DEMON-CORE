@@ -1,46 +1,43 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.7
+DΞMON CORE - HYBRID FEEDER v1.8
 ================================
-- NAVIGATION_FAILED / FETCH_FAILED when bytes=0 or exception
-- EMPTY_RESULTS only when navigation succeeded with content but no useful results
-- Architecture unchanged
+- Acquisition only: proxies + transport tiers
+- Domain extraction delegated to SearchProvider (Mycelium)
+- NAVIGATION_FAILED / FETCH_FAILED classification
+- Precise browser goto errors via BrowserEngine
 """
 
 import os
-import re
 import time
 import asyncio
 import random
 import logging
-from urllib.parse import urlparse, quote_plus, unquote
-from typing import Optional, List, Tuple
+from urllib.parse import quote_plus
+from typing import Optional, Tuple
 
-from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 from proxy_scoring import ProxyScorer
 from stealth import get_stealth_headers
 from browser_engine import BrowserEngine
+from search_provider import get_search_provider, SearchProvider
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 TARGET_FILE = "targets.txt"
 DORKS_FILE = "dorks.txt"
-BANNED_DOMAINS = [
-    "google", "youtube", "facebook", "github.com", "gitlab.com",
-    "stackoverflow", "microsoft", "bing", "yahoo", "duckduckgo",
-    "support.google", "accounts.google", "policies.google"
-]
 
 MAX_BROWSER_SESSIONS = int(os.getenv("MAX_BROWSER_SESSIONS", "1"))
 BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_BROWSER_SESSIONS)
+SEARCH_PROVIDER_NAME = os.getenv("SEARCH_PROVIDER", "google")
 
 logger = logging.getLogger("HYBRID_FEEDER")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 scorer: Optional[ProxyScorer] = None
+provider: Optional[SearchProvider] = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,71 +60,11 @@ def _mask_proxy(proxy: Optional[str]) -> str:
         return f"{host}:{port}"
     return "***"
 
-def classify_google_page(html: Optional[str]) -> str:
-    """
-    Classify Google response content.
-
-    NAVIGATION_FAILED / FETCH_FAILED:
-        html is None or bytes == 0 (navigation never produced content).
-
-    EMPTY_RESULTS:
-        navigation succeeded (html size > 0) but no useful links/results.
-
-    Other states: CAPTCHA, JS_REQUIRED, CONSENT_PAGE, SEARCH_RESULTS,
-                  SEARCH_BLOCKED, ERROR_PAGE, UNKNOWN
-    """
-    # --- Fetch / navigation never produced content ---
-    if html is None or len(html) == 0:
-        return "NAVIGATION_FAILED"
-
-    lower = html.lower()
-
-    captcha_signals = [
-        "unusual traffic", "our systems have detected", "prove you're not a robot",
-        "captcha", "recaptcha", "/sorry/", "sorry/index", "g-recaptcha"
-    ]
-    if any(s in lower for s in captcha_signals):
-        return "CAPTCHA"
-
-    js_signals = [
-        "enablejs", "httpservice/retry", "emsg=sg_rel", "sg_rel",
-        "please enable javascript", "enable javascript", "jsdisabled"
-    ]
-    if any(s in lower for s in js_signals):
-        return "JS_REQUIRED"
-
-    consent_signals = [
-        "before you continue", "consent.google", "we use cookies",
-        "accept all", "reject all", "cookie consent"
-    ]
-    if any(s in lower for s in consent_signals):
-        return "CONSENT_PAGE"
-
-    result_markers = ["yurubf", "/url?q=", "data-ved", 'class="g "', 'class="g"', "result-stats", "kcr9t"]
-    if any(m in lower for m in result_markers):
-        return "SEARCH_RESULTS"
-
-    if "support.google.com/websearch" in lower and html.count("<a ") < 10:
-        return "SEARCH_BLOCKED"
-
-    # Tiny payload after a successful transfer → likely error fragment
-    if len(html) < 200:
-        return "ERROR_PAGE"
-
-    # Loaded successfully (bytes > 0) but almost no links → empty results page
-    if html.count("<a ") < 8 and html.count("href=") < 10:
-        return "EMPTY_RESULTS"
-
-    return "UNKNOWN"
-
 def is_usable_search_html(html: Optional[str], final_url: str = "") -> bool:
-    """
-    True only when the page looks like actual Google search results.
-    NAVIGATION_FAILED / JS_REQUIRED / CAPTCHA / etc. are NOT usable.
-    """
-    if not html:
+    """Delegate page-type decision to SearchProvider."""
+    if not html or provider is None:
         return False
-    page_type = classify_google_page(html)
+    page_type = provider.classify(html)
     if page_type in (
         "NAVIGATION_FAILED", "FETCH_FAILED",
         "JS_REQUIRED", "CAPTCHA", "CONSENT_PAGE",
@@ -139,35 +76,6 @@ def is_usable_search_html(html: Optional[str], final_url: str = "") -> bool:
     if page_type == "UNKNOWN" and (html.count("/url?q=") > 0 or html.count("http") > 20):
         return True
     return False
-
-def is_poisoned(html: Optional[str], final_url: str = "") -> bool:
-    """Non-usable page types count as poisoned/failed for escalation."""
-    if not html:
-        return True
-    if not is_usable_search_html(html, final_url):
-        return True
-    lower = html.lower()
-    url_lower = (final_url or "").lower()
-    for sig in [
-        "unusual traffic", "our systems have detected", "prove you're not a robot",
-        "captcha", "recaptcha", "/sorry/", "sorry/index"
-    ]:
-        if sig in lower or sig in url_lower:
-            return True
-    return False
-
-def clean_domain(url: str) -> Optional[str]:
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc
-        if ":" in domain:
-            domain = domain.split(":")[0]
-        domain = domain.replace("www.", "").lower()
-        if domain and "." in domain:
-            return domain
-    except Exception:
-        pass
-    return None
 
 def save_target(domain: str) -> bool:
     if not domain:
@@ -182,146 +90,10 @@ def save_target(domain: str) -> bool:
         return True
     return False
 
-def _is_banned(domain: str) -> bool:
-    return any(b in domain for b in BANNED_DOMAINS)
-
-# ---------------------------------------------------------------------------
-# Parsing: classic selectors + broad fallback
-# ---------------------------------------------------------------------------
-def parse_google_results(html: str) -> List[str]:
-    domains: List[str] = []
-    css_candidates = 0
-    css_valid = 0
-    regex_candidates = 0
-    regex_valid = 0
-    fallback_valid = 0
-
-    page_type = classify_google_page(html)
-    print(f"[DIAG][PAGE_TYPE] {page_type}")
-
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        all_anchors = soup.find_all("a", href=True)
-        print(f"[DIAG][HTML] input_bytes={len(html)} total <a> tags={len(all_anchors)}")
-        print(f"[DIAG][HTML] yuRUbf={'yes' if 'yuRUbf' in html else 'no'}  /url?q={'yes' if '/url?q=' in html else 'no'}  data-ved={'yes' if 'data-ved' in html else 'no'}")
-
-        samples = []
-        for a in all_anchors[:40]:
-            href = (a.get("href") or "").strip()
-            if not href or href.startswith("#") or href.startswith("javascript:"):
-                continue
-            samples.append(href)
-            if len(samples) >= 8:
-                break
-        for i, s in enumerate(samples, 1):
-            shown = s if len(s) <= 120 else s[:117] + "..."
-            print(f"[DIAG][LINK] sample {i} = {shown}")
-    except Exception as e:
-        print(f"[DIAG][HTML] diagnostic failed: {e}")
-        soup = None
-
-    # --- 1) Classic CSS selectors ---
-    try:
-        if soup is None:
-            soup = BeautifulSoup(html, "lxml")
-
-        selectors = [
-            "div.yuRUbf > a",
-            "div.g a",
-            "a[href^='/url?q=']",
-            "a[data-ved]",
-            "div#search a[href]",
-            "div#rso a[href]",
-            "a[href^='http']",
-        ]
-
-        for sel in selectors:
-            for a in soup.select(sel):
-                css_candidates += 1
-                href = a.get("href", "") or ""
-                if href.startswith("/url?q="):
-                    href = unquote(href.split("/url?q=")[1].split("&")[0])
-                if href.startswith("http") and "google." not in href:
-                    domain = clean_domain(href)
-                    if domain and not _is_banned(domain):
-                        css_valid += 1
-                        if domain not in domains:
-                            domains.append(domain)
-
-        if domains:
-            print(f"[DIAG][PARSER] CSS candidates={css_candidates} CSS valid={css_valid} final unique={len(domains)}")
-            return domains
-    except Exception:
-        pass
-
-    # --- 2) Regex /url?q= ---
-    try:
-        pattern = r'/url\?q=(https?://[^&\s"\']+)'
-        matches = re.findall(pattern, html)
-        for raw in matches:
-            regex_candidates += 1
-            href = unquote(raw)
-            if "google." in href:
-                continue
-            domain = clean_domain(href)
-            if domain and not _is_banned(domain):
-                regex_valid += 1
-                if domain not in domains:
-                    domains.append(domain)
-        if domains:
-            print(f"[DIAG][PARSER] Regex candidates={regex_candidates} Regex valid={regex_valid} final unique={len(domains)}")
-            return domains
-    except Exception:
-        pass
-
-    # --- 3) Broad fallback: any external http(s) link in the page ---
-    try:
-        if soup is None:
-            soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if href.startswith("/url?q="):
-                href = unquote(href.split("/url?q=")[1].split("&")[0])
-            if not href.startswith("http"):
-                continue
-            if "google." in href or "gstatic." in href or "youtube." in href:
-                continue
-            domain = clean_domain(href)
-            if domain and not _is_banned(domain):
-                fallback_valid += 1
-                if domain not in domains:
-                    domains.append(domain)
-    except Exception:
-        pass
-
-    # --- 4) Last-resort regex for bare https URLs in HTML ---
-    if not domains:
-        try:
-            bare = re.findall(r'https?://[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?', html)
-            for href in bare:
-                if "google." in href or "gstatic." in href:
-                    continue
-                domain = clean_domain(href)
-                if domain and not _is_banned(domain) and domain not in domains:
-                    domains.append(domain)
-                    fallback_valid += 1
-        except Exception:
-            pass
-
-    print(
-        f"[DIAG][PARSER] CSS={css_candidates}/{css_valid} Regex={regex_candidates}/{regex_valid} "
-        f"Fallback={fallback_valid} final unique={len(domains)}"
-    )
-    return domains
-
-# ---------------------------------------------------------------------------
-# Humanized delay
-# ---------------------------------------------------------------------------
 async def humanized_delay(min_s: float = 2.8, max_s: float = 7.5):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 def _google_url(dork: str, start: int = 0, basic: bool = True) -> str:
-    """Build Google search URL. basic=True uses gbv=1 (simpler HTML)."""
     query = quote_plus(dork)
     extra = "&gbv=1" if basic else ""
     return f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}{extra}"
@@ -336,7 +108,6 @@ async def fetch_with_curl(
     impersonate: str = "chrome120",
     tier_label: str = "TIER1",
 ) -> Tuple[Optional[str], str, bool]:
-    """Returns (html, final_url, is_poisoned/unusable)"""
     global scorer
 
     url = _google_url(dork, start, basic=True)
@@ -368,10 +139,11 @@ async def fetch_with_curl(
             if not html:
                 print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
                 return None, final_url, True
+            page_type = provider.classify(html) if provider else "UNKNOWN"
             if status == 200 and is_usable_search_html(html, final_url):
-                print(f"[DIAG][PAGE_TYPE] {classify_google_page(html)} → usable")
+                print(f"[DIAG][PAGE_TYPE] {page_type} → usable")
                 return html, final_url, False
-            print(f"[DIAG][PAGE_TYPE] {classify_google_page(html)} → unusable")
+            print(f"[DIAG][PAGE_TYPE] {page_type} → unusable")
             return None, final_url, True
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme=direct exception={type(e).__name__}: {e}")
@@ -394,7 +166,7 @@ async def fetch_with_curl(
 
             if status == 200:
                 usable = is_usable_search_html(html, final_url)
-                page_type = classify_google_page(html)
+                page_type = provider.classify(html) if provider else "UNKNOWN"
                 print(f"[DIAG][PAGE_TYPE] {page_type} → {'usable' if usable else 'unusable'}")
 
                 if usable:
@@ -415,7 +187,7 @@ async def fetch_with_curl(
     return None, url, True
 
 # ---------------------------------------------------------------------------
-# Tier 3: BrowserEngine (full JS rendering)
+# Tier 3: BrowserEngine
 # ---------------------------------------------------------------------------
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
     global scorer
@@ -444,14 +216,13 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
                 elapsed = time.time() - start_time
                 bytes_len = len(html) if html else 0
 
-                # bytes=0 or None → NAVIGATION_FAILED (not EMPTY_RESULTS)
                 if not html or bytes_len == 0:
-                    print(f"[DIAG][BROWSER] navigation=failed bytes=0")
+                    print("[DIAG][BROWSER] navigation=failed bytes=0")
                     print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
                     await scorer.record_result(raw_proxy, False, elapsed)
                     return None, final_url or url, True
 
-                page_type = classify_google_page(html)
+                page_type = provider.classify(html) if provider else "UNKNOWN"
                 usable = is_usable_search_html(html, final_url)
 
                 print(
@@ -467,7 +238,6 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
                     return None, final_url or url, True
 
         except Exception as e:
-            # Exception during goto / engine lifecycle → NAVIGATION_FAILED
             print(f"[DIAG][BROWSER] navigation=failed exception={type(e).__name__}: {e}")
             print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
             if raw_proxy:
@@ -506,7 +276,7 @@ async def fetch_page_with_escalation(
     return None
 
 # ---------------------------------------------------------------------------
-# Main search cycle
+# Main search cycle — acquisition only; extraction via SearchProvider
 # ---------------------------------------------------------------------------
 async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> int:
     print(f"\n[DIAG][DORK] start | {dork}")
@@ -530,7 +300,10 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 
         print(f"[DIAG][RESPONSE] received=true bytes={len(html)}")
 
-        domains = parse_google_results(html)
+        # --- Mycelium: extraction delegated to SearchProvider ---
+        extract = provider.extract_domains(html)
+        domains = extract.domains
+
         if not domains:
             print("[DIAG][OUTPUT] domain_candidates=0 new_targets=0 duplicates=0")
             print("   ⚠️ No usable domains extracted.")
@@ -562,11 +335,15 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 # Entry point
 # ---------------------------------------------------------------------------
 async def start_feeding():
-    global scorer
+    global scorer, provider
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.7 (NAVIGATION_FAILED / EMPTY_RESULTS)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.8 (MYCELIUM / SearchProvider)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
+    print(f"[CONFIG] SEARCH_PROVIDER = {SEARCH_PROVIDER_NAME}")
+
+    provider = get_search_provider(SEARCH_PROVIDER_NAME)
+    print(f"[PROVIDER] Active: {provider.name}")
 
     scorer = ProxyScorer(proxy_file="proxy.txt", state_file="proxy_scores.json")
     summary = await scorer.get_stats_summary()
