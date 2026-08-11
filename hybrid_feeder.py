@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.8
+DΞMON CORE - HYBRID FEEDER v1.9
 ================================
-- Acquisition only: proxies + transport tiers
-- Domain extraction delegated to SearchProvider (Mycelium)
-- NAVIGATION_FAILED / FETCH_FAILED classification
-- Precise browser goto errors via BrowserEngine
+- Parallel scheme race (HTTP/SOCKS4/SOCKS5) with FIRST_COMPLETED
+- Fast-fail probe timeout 5s
+- Winner takes all; losers cancelled immediately
+- Acquisition only; extraction via SearchProvider
 """
 
 import os
@@ -14,7 +14,7 @@ import asyncio
 import random
 import logging
 from urllib.parse import quote_plus
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Any
 
 from curl_cffi.requests import AsyncSession
 
@@ -32,6 +32,11 @@ DORKS_FILE = "dorks.txt"
 MAX_BROWSER_SESSIONS = int(os.getenv("MAX_BROWSER_SESSIONS", "1"))
 BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_BROWSER_SESSIONS)
 SEARCH_PROVIDER_NAME = os.getenv("SEARCH_PROVIDER", "google")
+
+# Fast-fail: handshake / scheme probe only (not full page budget)
+SCHEME_PROBE_TIMEOUT = float(os.getenv("SCHEME_PROBE_TIMEOUT", "5"))
+# Full fetch timeout after scheme is known
+FETCH_TIMEOUT = float(os.getenv("FETCH_TIMEOUT", "20"))
 
 logger = logging.getLogger("HYBRID_FEEDER")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -61,7 +66,6 @@ def _mask_proxy(proxy: Optional[str]) -> str:
     return "***"
 
 def is_usable_search_html(html: Optional[str], final_url: str = "") -> bool:
-    """Delegate page-type decision to SearchProvider."""
     if not html or provider is None:
         return False
     page_type = provider.classify(html)
@@ -99,7 +103,99 @@ def _google_url(dork: str, start: int = 0, basic: bool = True) -> str:
     return f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}{extra}"
 
 # ---------------------------------------------------------------------------
-# Tier 1 & Tier 2: curl_cffi
+# Parallel scheme race — FIRST_COMPLETED, cancel losers
+# ---------------------------------------------------------------------------
+async def _race_schemes(
+    session: AsyncSession,
+    url: str,
+    headers: dict,
+    candidates: List[str],
+    impersonate: str,
+    tier_label: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], float]:
+    """
+    Fire all scheme candidates concurrently.
+    First successful response (status 200 + body) wins.
+    Remaining tasks are cancelled immediately.
+
+    Returns: (proxy_url, scheme, html, final_url, elapsed) or (None, None, None, None, elapsed)
+    """
+
+    async def _probe(proxy_url: str) -> Tuple[bool, str, str, int, str, str, float]:
+        scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
+        t0 = time.time()
+        try:
+            resp = await session.get(
+                url,
+                headers=headers,
+                proxy=proxy_url,
+                timeout=SCHEME_PROBE_TIMEOUT,
+                allow_redirects=True,
+                impersonate=impersonate,
+            )
+            elapsed = time.time() - t0
+            html = resp.text or ""
+            final_url = str(resp.url) if hasattr(resp, "url") else url
+            ok = resp.status_code == 200 and len(html) > 0
+            print(
+                f"[DIAG][RACE] tier={tier_label} scheme={scheme} "
+                f"status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s "
+                f"result={'WIN' if ok else 'fail'}"
+            )
+            return ok, proxy_url, scheme, resp.status_code, html, final_url, elapsed
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(
+                f"[DIAG][RACE] tier={tier_label} scheme={scheme} "
+                f"exception={type(e).__name__}: {e} elapsed={elapsed:.2f}s result=fail"
+            )
+            return False, proxy_url, scheme, 0, "", url, elapsed
+
+    tasks = {asyncio.create_task(_probe(c)): c for c in candidates}
+    pending = set(tasks.keys())
+    race_start = time.time()
+
+    print(f"[DIAG][RACE] launching {len(pending)} schemes in parallel (timeout={SCHEME_PROBE_TIMEOUT}s)")
+
+    winner: Optional[Tuple[Any, ...]] = None
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done:
+            try:
+                ok, proxy_url, scheme, status, html, final_url, elapsed = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as e:
+                print(f"[DIAG][RACE] task error: {type(e).__name__}: {e}")
+                continue
+
+            if ok and winner is None:
+                winner = (proxy_url, scheme, html, final_url, elapsed)
+                # Mercy kill: cancel all remaining probes immediately
+                for p in pending:
+                    p.cancel()
+                # Drain cancellations
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                pending.clear()
+                break
+
+    total_elapsed = time.time() - race_start
+
+    if winner:
+        proxy_url, scheme, html, final_url, elapsed = winner
+        print(f"[DIAG][RACE] WINNER scheme={scheme} elapsed={elapsed:.2f}s total_race={total_elapsed:.2f}s")
+        return proxy_url, scheme, html, final_url, elapsed
+
+    print(f"[DIAG][RACE] all schemes failed total_race={total_elapsed:.2f}s")
+    return None, None, None, None, total_elapsed
+
+# ---------------------------------------------------------------------------
+# Tier 1 & Tier 2: curl_cffi + parallel scheme race
 # ---------------------------------------------------------------------------
 async def fetch_with_curl(
     session: AsyncSession,
@@ -116,31 +212,27 @@ async def fetch_with_curl(
 
     print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)}")
 
-    async def _try_once(proxy_url: Optional[str], scheme: str):
-        t0 = time.time()
-        resp = await session.get(
-            url,
-            headers=headers,
-            proxy=proxy_url,
-            timeout=28,
-            allow_redirects=True,
-            impersonate=impersonate,
-        )
-        final_url = str(resp.url) if hasattr(resp, "url") else url
-        html = resp.text or ""
-        elapsed = time.time() - t0
-        print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
-        return resp.status_code, html, final_url, elapsed
-
+    # --- Direct (no proxy) ---
     if not raw_proxy:
         print("[DIAG][PROXY] no proxy available → direct")
         try:
-            status, html, final_url, _ = await _try_once(None, "direct")
+            t0 = time.time()
+            resp = await session.get(
+                url,
+                headers=headers,
+                timeout=FETCH_TIMEOUT,
+                allow_redirects=True,
+                impersonate=impersonate,
+            )
+            html = resp.text or ""
+            final_url = str(resp.url) if hasattr(resp, "url") else url
+            elapsed = time.time() - t0
+            print(f"[DIAG][HTTP] tier={tier_label} scheme=direct status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
             if not html:
                 print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
                 return None, final_url, True
             page_type = provider.classify(html) if provider else "UNKNOWN"
-            if status == 200 and is_usable_search_html(html, final_url):
+            if resp.status_code == 200 and is_usable_search_html(html, final_url):
                 print(f"[DIAG][PAGE_TYPE] {page_type} → usable")
                 return html, final_url, False
             print(f"[DIAG][PAGE_TYPE] {page_type} → unusable")
@@ -151,39 +243,67 @@ async def fetch_with_curl(
             return None, url, True
 
     candidates = scorer.get_scheme_candidates(raw_proxy)
-    print(f"[DIAG][PROXY] scheme candidates={[c.split('://')[0] for c in candidates]}")
+    schemes = [c.split("://")[0] for c in candidates]
+    print(f"[DIAG][PROXY] scheme candidates={schemes}")
     start_time = time.time()
 
-    for proxy_url in candidates:
-        scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
+    # Single known scheme → no race needed
+    if len(candidates) == 1:
+        proxy_url = candidates[0]
+        scheme = schemes[0]
         try:
-            status, html, final_url, elapsed = await _try_once(proxy_url, scheme)
+            t0 = time.time()
+            resp = await session.get(
+                url,
+                headers=headers,
+                proxy=proxy_url,
+                timeout=FETCH_TIMEOUT,
+                allow_redirects=True,
+                impersonate=impersonate,
+            )
+            html = resp.text or ""
+            final_url = str(resp.url) if hasattr(resp, "url") else url
+            elapsed = time.time() - t0
+            print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
 
-            if not html:
-                print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
-                await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                continue
-
-            if status == 200:
+            if resp.status_code == 200 and html:
                 usable = is_usable_search_html(html, final_url)
                 page_type = provider.classify(html) if provider else "UNKNOWN"
                 print(f"[DIAG][PAGE_TYPE] {page_type} → {'usable' if usable else 'unusable'}")
-
                 if usable:
                     await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
                     return html, final_url, False
-                else:
-                    await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                    continue
-            else:
                 await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                if status in (403, 429, 503):
-                    continue
+                return None, final_url, True
+
+            await scorer.record_result(raw_proxy, False, time.time() - start_time)
+            return None, final_url, True
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} exception={type(e).__name__}: {e}")
             print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
             await scorer.record_result(raw_proxy, False, time.time() - start_time)
+            return None, url, True
 
+    # --- Parallel race for unknown multi-scheme proxies ---
+    proxy_url, scheme, html, final_url, elapsed = await _race_schemes(
+        session, url, headers, candidates, impersonate, tier_label
+    )
+
+    if proxy_url and html and scheme:
+        usable = is_usable_search_html(html, final_url or url)
+        page_type = provider.classify(html) if provider else "UNKNOWN"
+        print(f"[DIAG][PAGE_TYPE] {page_type} → {'usable' if usable else 'unusable'}")
+
+        if usable:
+            await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
+            return html, final_url or url, False
+
+        # Scheme connected but content not usable — soft fail
+        await scorer.record_result(raw_proxy, False, time.time() - start_time)
+        return None, final_url or url, True
+
+    await scorer.record_result(raw_proxy, False, time.time() - start_time)
+    print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
     return None, url, True
 
 # ---------------------------------------------------------------------------
@@ -276,7 +396,7 @@ async def fetch_page_with_escalation(
     return None
 
 # ---------------------------------------------------------------------------
-# Main search cycle — acquisition only; extraction via SearchProvider
+# Main search cycle
 # ---------------------------------------------------------------------------
 async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> int:
     print(f"\n[DIAG][DORK] start | {dork}")
@@ -300,7 +420,6 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 
         print(f"[DIAG][RESPONSE] received=true bytes={len(html)}")
 
-        # --- Mycelium: extraction delegated to SearchProvider ---
         extract = provider.extract_domains(html)
         domains = extract.domains
 
@@ -337,10 +456,11 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer, provider
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.8 (MYCELIUM / SearchProvider)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.9 (PARALLEL SCHEME RACE)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
     print(f"[CONFIG] SEARCH_PROVIDER = {SEARCH_PROVIDER_NAME}")
+    print(f"[CONFIG] SCHEME_PROBE_TIMEOUT = {SCHEME_PROBE_TIMEOUT}s")
 
     provider = get_search_provider(SEARCH_PROVIDER_NAME)
     print(f"[PROVIDER] Active: {provider.name}")
