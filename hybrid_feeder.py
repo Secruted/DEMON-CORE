@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.4
+DΞMON CORE - HYBRID FEEDER v1.5
 ================================
-Escalation Matrix Feeder + Diagnostic Telemetry
+Escalation Matrix Feeder + Diagnostic Telemetry + Page Type Classification
 
-Logic unchanged. Only diagnostic hooks added for:
-PROXY → HTTP → POISON → BROWSER → RESPONSE → PARSER → OUTPUT
+Logic unchanged. Only diagnostic/classification hooks added.
 """
 
 import os
@@ -77,6 +76,58 @@ def _poison_reason(html: str, final_url: str = "") -> str:
     if "/sorry/" in url_lower or "sorry/index" in url_lower:
         return "sorry_path"
     return "unknown"
+
+def classify_google_page(html: str) -> str:
+    """
+    Classify Google response type. Diagnostic only — does not change behavior.
+    Possible values:
+      SEARCH_RESULTS | JS_REQUIRED | CONSENT_PAGE | CAPTCHA |
+      SEARCH_BLOCKED | ERROR_PAGE | EMPTY_RESULTS | UNKNOWN
+    """
+    if not html or len(html) < 200:
+        return "EMPTY_RESULTS"
+
+    lower = html.lower()
+
+    # CAPTCHA / soft block
+    captcha_signals = [
+        "unusual traffic", "our systems have detected", "prove you're not a robot",
+        "captcha", "recaptcha", "/sorry/", "sorry/index", "g-recaptcha"
+    ]
+    if any(s in lower for s in captcha_signals):
+        return "CAPTCHA"
+
+    # JS required / enablejs / SG_REL patterns
+    js_signals = [
+        "enablejs", "httpservice/retry", "emsg=sg_rel", "sg_rel",
+        "please enable javascript", "enable javascript",
+        "noscript", "jsdisabled"
+    ]
+    if any(s in lower for s in js_signals):
+        return "JS_REQUIRED"
+
+    # Consent / cookie wall
+    consent_signals = [
+        "before you continue", "consent.google", "we use cookies",
+        "accept all", "reject all", "cookie consent"
+    ]
+    if any(s in lower for s in consent_signals):
+        return "CONSENT_PAGE"
+
+    # Classic search result markers
+    result_markers = ["yurubf", "/url?q=", "data-ved", 'class="g "', 'class="g"', "result-stats"]
+    if any(m in lower for m in result_markers):
+        return "SEARCH_RESULTS"
+
+    # Soft blocked / interstitial without explicit captcha text
+    if "support.google.com/websearch" in lower and html.count("<a ") < 10:
+        return "SEARCH_BLOCKED"
+
+    # Very few links → likely not a results page
+    if html.count("<a ") < 8 and html.count("href=") < 10:
+        return "ERROR_PAGE"
+
+    return "UNKNOWN"
 
 # ---------------------------------------------------------------------------
 # Advanced Poison Detection
@@ -150,7 +201,7 @@ def save_target(domain: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Parsing with CSS + Regex fallback + DETAILED DIAG (no logic change)
+# Parsing with CSS + Regex fallback + PAGE TYPE CLASSIFICATION (no logic change)
 # ---------------------------------------------------------------------------
 def parse_google_results(html: str) -> List[str]:
     domains: List[str] = []
@@ -159,7 +210,11 @@ def parse_google_results(html: str) -> List[str]:
     regex_candidates = 0
     regex_valid = 0
 
-    # --- DIAGNOSTIC ONLY (does not change extraction) ---
+    # --- PAGE TYPE CLASSIFICATION (diagnostic only) ---
+    page_type = classify_google_page(html)
+    print(f"[DIAG][PAGE_TYPE] {page_type}")
+
+    # --- DETAILED HTML DIAG ---
     try:
         soup_diag = BeautifulSoup(html, "lxml")
         all_anchors = soup_diag.find_all("a", href=True)
@@ -167,13 +222,11 @@ def parse_google_results(html: str) -> List[str]:
 
         print(f"[DIAG][HTML] input_bytes={len(html)} total <a> tags={total_a}")
 
-        # Marker presence
         has_yurubf = "yuRUbf" in html
         has_url_q = "/url?q=" in html
         has_data_ved = "data-ved" in html
         print(f"[DIAG][HTML] yuRUbf={'yes' if has_yurubf else 'no'}  /url?q={'yes' if has_url_q else 'no'}  data-ved={'yes' if has_data_ved else 'no'}")
 
-        # Sample first 8 hrefs (raw)
         samples = []
         for a in all_anchors[:30]:
             href = (a.get("href") or "").strip()
@@ -184,7 +237,6 @@ def parse_google_results(html: str) -> List[str]:
                 break
 
         for i, s in enumerate(samples, 1):
-            # Truncate long samples for readability
             shown = s if len(s) <= 120 else s[:117] + "..."
             print(f"[DIAG][LINK] sample {i} = {shown}")
 
@@ -474,7 +526,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.4 (DIAGNOSTIC TELEMETRY)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.5 (PAGE TYPE CLASSIFICATION)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
 
