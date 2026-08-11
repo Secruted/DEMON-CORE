@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.6
+DΞMON CORE - HYBRID FEEDER v1.7
 ================================
-- Treat JS_REQUIRED / non-results pages as failure → escalate
-- Use Google basic HTML mode (gbv=1) for curl tiers
-- Broad link fallback in parse_google_results when classic selectors fail
+- NAVIGATION_FAILED / FETCH_FAILED when bytes=0 or exception
+- EMPTY_RESULTS only when navigation succeeded with content but no useful results
 - Architecture unchanged
 """
 
@@ -64,9 +63,22 @@ def _mask_proxy(proxy: Optional[str]) -> str:
         return f"{host}:{port}"
     return "***"
 
-def classify_google_page(html: str) -> str:
-    if not html or len(html) < 200:
-        return "EMPTY_RESULTS"
+def classify_google_page(html: Optional[str]) -> str:
+    """
+    Classify Google response content.
+
+    NAVIGATION_FAILED / FETCH_FAILED:
+        html is None or bytes == 0 (navigation never produced content).
+
+    EMPTY_RESULTS:
+        navigation succeeded (html size > 0) but no useful links/results.
+
+    Other states: CAPTCHA, JS_REQUIRED, CONSENT_PAGE, SEARCH_RESULTS,
+                  SEARCH_BLOCKED, ERROR_PAGE, UNKNOWN
+    """
+    # --- Fetch / navigation never produced content ---
+    if html is None or len(html) == 0:
+        return "NAVIGATION_FAILED"
 
     lower = html.lower()
 
@@ -98,31 +110,38 @@ def classify_google_page(html: str) -> str:
     if "support.google.com/websearch" in lower and html.count("<a ") < 10:
         return "SEARCH_BLOCKED"
 
-    if html.count("<a ") < 8 and html.count("href=") < 10:
+    # Tiny payload after a successful transfer → likely error fragment
+    if len(html) < 200:
         return "ERROR_PAGE"
+
+    # Loaded successfully (bytes > 0) but almost no links → empty results page
+    if html.count("<a ") < 8 and html.count("href=") < 10:
+        return "EMPTY_RESULTS"
 
     return "UNKNOWN"
 
-def is_usable_search_html(html: str, final_url: str = "") -> bool:
+def is_usable_search_html(html: Optional[str], final_url: str = "") -> bool:
     """
     True only when the page looks like actual Google search results.
-    JS_REQUIRED / CAPTCHA / consent / blocked pages are NOT usable.
+    NAVIGATION_FAILED / JS_REQUIRED / CAPTCHA / etc. are NOT usable.
     """
     if not html:
         return False
     page_type = classify_google_page(html)
-    if page_type in ("JS_REQUIRED", "CAPTCHA", "CONSENT_PAGE", "SEARCH_BLOCKED", "ERROR_PAGE", "EMPTY_RESULTS"):
+    if page_type in (
+        "NAVIGATION_FAILED", "FETCH_FAILED",
+        "JS_REQUIRED", "CAPTCHA", "CONSENT_PAGE",
+        "SEARCH_BLOCKED", "ERROR_PAGE", "EMPTY_RESULTS",
+    ):
         return False
-    # Prefer explicit search markers; UNKNOWN with many links may still be usable
     if page_type == "SEARCH_RESULTS":
         return True
-    # UNKNOWN: require some external-looking links
     if page_type == "UNKNOWN" and (html.count("/url?q=") > 0 or html.count("http") > 20):
         return True
     return False
 
-def is_poisoned(html: str, final_url: str = "") -> bool:
-    """Legacy poison check + non-usable page types."""
+def is_poisoned(html: Optional[str], final_url: str = "") -> bool:
+    """Non-usable page types count as poisoned/failed for escalation."""
     if not html:
         return True
     if not is_usable_search_html(html, final_url):
@@ -304,7 +323,6 @@ async def humanized_delay(min_s: float = 2.8, max_s: float = 7.5):
 def _google_url(dork: str, start: int = 0, basic: bool = True) -> str:
     """Build Google search URL. basic=True uses gbv=1 (simpler HTML)."""
     query = quote_plus(dork)
-    # gbv=1 → Google Basic Version (HTML, less JS)
     extra = "&gbv=1" if basic else ""
     return f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}{extra}"
 
@@ -347,6 +365,9 @@ async def fetch_with_curl(
         print("[DIAG][PROXY] no proxy available → direct")
         try:
             status, html, final_url, _ = await _try_once(None, "direct")
+            if not html:
+                print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
+                return None, final_url, True
             if status == 200 and is_usable_search_html(html, final_url):
                 print(f"[DIAG][PAGE_TYPE] {classify_google_page(html)} → usable")
                 return html, final_url, False
@@ -354,6 +375,7 @@ async def fetch_with_curl(
             return None, final_url, True
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme=direct exception={type(e).__name__}: {e}")
+            print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
             return None, url, True
 
     candidates = scorer.get_scheme_candidates(raw_proxy)
@@ -365,6 +387,11 @@ async def fetch_with_curl(
         try:
             status, html, final_url, elapsed = await _try_once(proxy_url, scheme)
 
+            if not html:
+                print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
+                await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                continue
+
             if status == 200:
                 usable = is_usable_search_html(html, final_url)
                 page_type = classify_google_page(html)
@@ -374,7 +401,6 @@ async def fetch_with_curl(
                     await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
                     return html, final_url, False
                 else:
-                    # Connectivity ok but not search results — count as soft fail, try next scheme
                     await scorer.record_result(raw_proxy, False, time.time() - start_time)
                     continue
             else:
@@ -383,6 +409,7 @@ async def fetch_with_curl(
                     continue
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} exception={type(e).__name__}: {e}")
+            print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
             await scorer.record_result(raw_proxy, False, time.time() - start_time)
 
     return None, url, True
@@ -393,7 +420,6 @@ async def fetch_with_curl(
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
     global scorer
 
-    # Full Google (no gbv) so Chromium can render real results
     url = _google_url(dork, start, basic=False)
 
     raw_proxy = await scorer.get_best_proxy()
@@ -409,6 +435,7 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
             async with BrowserEngine(proxy=preferred, block_resources=True) as engine:
                 if not engine.enabled:
                     print("[DIAG][BROWSER] navigation=failed reason=engine_not_enabled")
+                    print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
                     if raw_proxy:
                         await scorer.record_result(raw_proxy, False, time.time() - start_time)
                     return None, url, True
@@ -416,12 +443,23 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
                 html, final_url = await engine.request(url)
                 elapsed = time.time() - start_time
                 bytes_len = len(html) if html else 0
-                usable = is_usable_search_html(html or "", final_url) if html else False
-                page_type = classify_google_page(html or "") if html else "EMPTY_RESULTS"
 
-                print(f"[DIAG][BROWSER] navigation={'success' if html else 'failed'} bytes={bytes_len} page_type={page_type} usable={usable} elapsed={elapsed:.2f}s")
+                # bytes=0 or None → NAVIGATION_FAILED (not EMPTY_RESULTS)
+                if not html or bytes_len == 0:
+                    print(f"[DIAG][BROWSER] navigation=failed bytes=0")
+                    print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
+                    await scorer.record_result(raw_proxy, False, elapsed)
+                    return None, final_url or url, True
 
-                if html and usable:
+                page_type = classify_google_page(html)
+                usable = is_usable_search_html(html, final_url)
+
+                print(
+                    f"[DIAG][BROWSER] navigation=success bytes={bytes_len} "
+                    f"page_type={page_type} usable={usable} elapsed={elapsed:.2f}s"
+                )
+
+                if usable:
                     await scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
                     return html, final_url, False
                 else:
@@ -429,7 +467,9 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
                     return None, final_url or url, True
 
         except Exception as e:
+            # Exception during goto / engine lifecycle → NAVIGATION_FAILED
             print(f"[DIAG][BROWSER] navigation=failed exception={type(e).__name__}: {e}")
+            print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
             if raw_proxy:
                 await scorer.record_result(raw_proxy, False, time.time() - start_time)
 
@@ -494,7 +534,6 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
         if not domains:
             print("[DIAG][OUTPUT] domain_candidates=0 new_targets=0 duplicates=0")
             print("   ⚠️ No usable domains extracted.")
-            # Do not break hard — try next page / continue cycle
             start += 30
             await humanized_delay(3.0, 6.0)
             continue
@@ -525,7 +564,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.6 (USABLE RESULTS + FALLBACK)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.7 (NAVIGATION_FAILED / EMPTY_RESULTS)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
 
