@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.5
+DΞMON CORE - HYBRID FEEDER v1.6
 ================================
-Escalation Matrix Feeder + Diagnostic Telemetry + Page Type Classification
-
-Logic unchanged. Only diagnostic/classification hooks added.
+- Treat JS_REQUIRED / non-results pages as failure → escalate
+- Use Google basic HTML mode (gbv=1) for curl tiers
+- Broad link fallback in parse_google_results when classic selectors fail
+- Architecture unchanged
 """
 
 import os
@@ -30,7 +31,8 @@ TARGET_FILE = "targets.txt"
 DORKS_FILE = "dorks.txt"
 BANNED_DOMAINS = [
     "google", "youtube", "facebook", "github.com", "gitlab.com",
-    "stackoverflow", "microsoft", "bing", "yahoo", "duckduckgo"
+    "stackoverflow", "microsoft", "bing", "yahoo", "duckduckgo",
+    "support.google", "accounts.google", "policies.google"
 ]
 
 MAX_BROWSER_SESSIONS = int(os.getenv("MAX_BROWSER_SESSIONS", "1"))
@@ -42,7 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 scorer: Optional[ProxyScorer] = None
 
 # ---------------------------------------------------------------------------
-# Helpers for safe logging
+# Helpers
 # ---------------------------------------------------------------------------
 def _mask_proxy(proxy: Optional[str]) -> str:
     if not proxy:
@@ -62,34 +64,12 @@ def _mask_proxy(proxy: Optional[str]) -> str:
         return f"{host}:{port}"
     return "***"
 
-def _poison_reason(html: str, final_url: str = "") -> str:
-    if not html:
-        return "empty_html"
-    lower = html.lower()
-    url_lower = (final_url or "").lower()
-    for sig in POISON_TEXT_SIGNATURES:
-        if sig in lower or sig in url_lower:
-            return sig
-    for sig in POISON_DOM_SIGNATURES:
-        if sig in lower:
-            return sig
-    if "/sorry/" in url_lower or "sorry/index" in url_lower:
-        return "sorry_path"
-    return "unknown"
-
 def classify_google_page(html: str) -> str:
-    """
-    Classify Google response type. Diagnostic only — does not change behavior.
-    Possible values:
-      SEARCH_RESULTS | JS_REQUIRED | CONSENT_PAGE | CAPTCHA |
-      SEARCH_BLOCKED | ERROR_PAGE | EMPTY_RESULTS | UNKNOWN
-    """
     if not html or len(html) < 200:
         return "EMPTY_RESULTS"
 
     lower = html.lower()
 
-    # CAPTCHA / soft block
     captcha_signals = [
         "unusual traffic", "our systems have detected", "prove you're not a robot",
         "captcha", "recaptcha", "/sorry/", "sorry/index", "g-recaptcha"
@@ -97,16 +77,13 @@ def classify_google_page(html: str) -> str:
     if any(s in lower for s in captcha_signals):
         return "CAPTCHA"
 
-    # JS required / enablejs / SG_REL patterns
     js_signals = [
         "enablejs", "httpservice/retry", "emsg=sg_rel", "sg_rel",
-        "please enable javascript", "enable javascript",
-        "noscript", "jsdisabled"
+        "please enable javascript", "enable javascript", "jsdisabled"
     ]
     if any(s in lower for s in js_signals):
         return "JS_REQUIRED"
 
-    # Consent / cookie wall
     consent_signals = [
         "before you continue", "consent.google", "we use cookies",
         "accept all", "reject all", "cookie consent"
@@ -114,66 +91,52 @@ def classify_google_page(html: str) -> str:
     if any(s in lower for s in consent_signals):
         return "CONSENT_PAGE"
 
-    # Classic search result markers
-    result_markers = ["yurubf", "/url?q=", "data-ved", 'class="g "', 'class="g"', "result-stats"]
+    result_markers = ["yurubf", "/url?q=", "data-ved", 'class="g "', 'class="g"', "result-stats", "kcr9t"]
     if any(m in lower for m in result_markers):
         return "SEARCH_RESULTS"
 
-    # Soft blocked / interstitial without explicit captcha text
     if "support.google.com/websearch" in lower and html.count("<a ") < 10:
         return "SEARCH_BLOCKED"
 
-    # Very few links → likely not a results page
     if html.count("<a ") < 8 and html.count("href=") < 10:
         return "ERROR_PAGE"
 
     return "UNKNOWN"
 
-# ---------------------------------------------------------------------------
-# Advanced Poison Detection
-# ---------------------------------------------------------------------------
-POISON_TEXT_SIGNATURES = [
-    "unusual traffic",
-    "our systems have detected",
-    "prove you're not a robot",
-    "detected unusual traffic",
-    "please complete the security check",
-    "captcha",
-    "recaptcha",
-    "/sorry/",
-    "sorry/index",
-]
-
-POISON_DOM_SIGNATURES = [
-    "captcha-form",
-    "g-recaptcha",
-    "recaptcha",
-    "cf-challenge",
-]
-
-def is_poisoned(html: str, final_url: str = "") -> bool:
+def is_usable_search_html(html: str, final_url: str = "") -> bool:
+    """
+    True only when the page looks like actual Google search results.
+    JS_REQUIRED / CAPTCHA / consent / blocked pages are NOT usable.
+    """
     if not html:
+        return False
+    page_type = classify_google_page(html)
+    if page_type in ("JS_REQUIRED", "CAPTCHA", "CONSENT_PAGE", "SEARCH_BLOCKED", "ERROR_PAGE", "EMPTY_RESULTS"):
+        return False
+    # Prefer explicit search markers; UNKNOWN with many links may still be usable
+    if page_type == "SEARCH_RESULTS":
         return True
-
-    lower = html.lower()
-    url_lower = (final_url or "").lower()
-
-    for sig in POISON_TEXT_SIGNATURES:
-        if sig in lower or sig in url_lower:
-            return True
-
-    for sig in POISON_DOM_SIGNATURES:
-        if sig in lower:
-            return True
-
-    if "/sorry/" in url_lower or "sorry/index" in url_lower:
+    # UNKNOWN: require some external-looking links
+    if page_type == "UNKNOWN" and (html.count("/url?q=") > 0 or html.count("http") > 20):
         return True
-
     return False
 
-# ---------------------------------------------------------------------------
-# Domain helpers
-# ---------------------------------------------------------------------------
+def is_poisoned(html: str, final_url: str = "") -> bool:
+    """Legacy poison check + non-usable page types."""
+    if not html:
+        return True
+    if not is_usable_search_html(html, final_url):
+        return True
+    lower = html.lower()
+    url_lower = (final_url or "").lower()
+    for sig in [
+        "unusual traffic", "our systems have detected", "prove you're not a robot",
+        "captcha", "recaptcha", "/sorry/", "sorry/index"
+    ]:
+        if sig in lower or sig in url_lower:
+            return True
+    return False
+
 def clean_domain(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
@@ -200,8 +163,11 @@ def save_target(domain: str) -> bool:
         return True
     return False
 
+def _is_banned(domain: str) -> bool:
+    return any(b in domain for b in BANNED_DOMAINS)
+
 # ---------------------------------------------------------------------------
-# Parsing with CSS + Regex fallback + PAGE TYPE CLASSIFICATION (no logic change)
+# Parsing: classic selectors + broad fallback
 # ---------------------------------------------------------------------------
 def parse_google_results(html: str) -> List[str]:
     domains: List[str] = []
@@ -209,46 +175,36 @@ def parse_google_results(html: str) -> List[str]:
     css_valid = 0
     regex_candidates = 0
     regex_valid = 0
+    fallback_valid = 0
 
-    # --- PAGE TYPE CLASSIFICATION (diagnostic only) ---
     page_type = classify_google_page(html)
     print(f"[DIAG][PAGE_TYPE] {page_type}")
 
-    # --- DETAILED HTML DIAG ---
     try:
-        soup_diag = BeautifulSoup(html, "lxml")
-        all_anchors = soup_diag.find_all("a", href=True)
-        total_a = len(all_anchors)
-
-        print(f"[DIAG][HTML] input_bytes={len(html)} total <a> tags={total_a}")
-
-        has_yurubf = "yuRUbf" in html
-        has_url_q = "/url?q=" in html
-        has_data_ved = "data-ved" in html
-        print(f"[DIAG][HTML] yuRUbf={'yes' if has_yurubf else 'no'}  /url?q={'yes' if has_url_q else 'no'}  data-ved={'yes' if has_data_ved else 'no'}")
+        soup = BeautifulSoup(html, "lxml")
+        all_anchors = soup.find_all("a", href=True)
+        print(f"[DIAG][HTML] input_bytes={len(html)} total <a> tags={len(all_anchors)}")
+        print(f"[DIAG][HTML] yuRUbf={'yes' if 'yuRUbf' in html else 'no'}  /url?q={'yes' if '/url?q=' in html else 'no'}  data-ved={'yes' if 'data-ved' in html else 'no'}")
 
         samples = []
-        for a in all_anchors[:30]:
+        for a in all_anchors[:40]:
             href = (a.get("href") or "").strip()
             if not href or href.startswith("#") or href.startswith("javascript:"):
                 continue
             samples.append(href)
             if len(samples) >= 8:
                 break
-
         for i, s in enumerate(samples, 1):
             shown = s if len(s) <= 120 else s[:117] + "..."
             print(f"[DIAG][LINK] sample {i} = {shown}")
-
-        if not samples:
-            print("[DIAG][LINK] no usable href samples found")
-
     except Exception as e:
-        print(f"[DIAG][HTML] diagnostic failed: {type(e).__name__}: {e}")
+        print(f"[DIAG][HTML] diagnostic failed: {e}")
+        soup = None
 
-    # --- ORIGINAL EXTRACTION LOGIC (unchanged) ---
+    # --- 1) Classic CSS selectors ---
     try:
-        soup = BeautifulSoup(html, "lxml")
+        if soup is None:
+            soup = BeautifulSoup(html, "lxml")
 
         selectors = [
             "div.yuRUbf > a",
@@ -256,28 +212,30 @@ def parse_google_results(html: str) -> List[str]:
             "a[href^='/url?q=']",
             "a[data-ved]",
             "div#search a[href]",
+            "div#rso a[href]",
+            "a[href^='http']",
         ]
 
         for sel in selectors:
             for a in soup.select(sel):
                 css_candidates += 1
-                href = a.get("href", "")
+                href = a.get("href", "") or ""
                 if href.startswith("/url?q="):
-                    href = href.split("/url?q=")[1].split("&")[0]
-                    href = unquote(href)
+                    href = unquote(href.split("/url?q=")[1].split("&")[0])
                 if href.startswith("http") and "google." not in href:
                     domain = clean_domain(href)
-                    if domain and not any(b in domain for b in BANNED_DOMAINS):
+                    if domain and not _is_banned(domain):
                         css_valid += 1
                         if domain not in domains:
                             domains.append(domain)
 
         if domains:
-            print(f"[DIAG][PARSER] CSS candidates={css_candidates} CSS valid={css_valid} Regex candidates=0 Regex valid=0 final unique={len(domains)}")
+            print(f"[DIAG][PARSER] CSS candidates={css_candidates} CSS valid={css_valid} final unique={len(domains)}")
             return domains
     except Exception:
         pass
 
+    # --- 2) Regex /url?q= ---
     try:
         pattern = r'/url\?q=(https?://[^&\s"\']+)'
         matches = re.findall(pattern, html)
@@ -287,14 +245,54 @@ def parse_google_results(html: str) -> List[str]:
             if "google." in href:
                 continue
             domain = clean_domain(href)
-            if domain and not any(b in domain for b in BANNED_DOMAINS):
+            if domain and not _is_banned(domain):
                 regex_valid += 1
+                if domain not in domains:
+                    domains.append(domain)
+        if domains:
+            print(f"[DIAG][PARSER] Regex candidates={regex_candidates} Regex valid={regex_valid} final unique={len(domains)}")
+            return domains
+    except Exception:
+        pass
+
+    # --- 3) Broad fallback: any external http(s) link in the page ---
+    try:
+        if soup is None:
+            soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if href.startswith("/url?q="):
+                href = unquote(href.split("/url?q=")[1].split("&")[0])
+            if not href.startswith("http"):
+                continue
+            if "google." in href or "gstatic." in href or "youtube." in href:
+                continue
+            domain = clean_domain(href)
+            if domain and not _is_banned(domain):
+                fallback_valid += 1
                 if domain not in domains:
                     domains.append(domain)
     except Exception:
         pass
 
-    print(f"[DIAG][PARSER] CSS candidates={css_candidates} CSS valid={css_valid} Regex candidates={regex_candidates} Regex valid={regex_valid} final unique={len(domains)}")
+    # --- 4) Last-resort regex for bare https URLs in HTML ---
+    if not domains:
+        try:
+            bare = re.findall(r'https?://[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?', html)
+            for href in bare:
+                if "google." in href or "gstatic." in href:
+                    continue
+                domain = clean_domain(href)
+                if domain and not _is_banned(domain) and domain not in domains:
+                    domains.append(domain)
+                    fallback_valid += 1
+        except Exception:
+            pass
+
+    print(
+        f"[DIAG][PARSER] CSS={css_candidates}/{css_valid} Regex={regex_candidates}/{regex_valid} "
+        f"Fallback={fallback_valid} final unique={len(domains)}"
+    )
     return domains
 
 # ---------------------------------------------------------------------------
@@ -303,8 +301,15 @@ def parse_google_results(html: str) -> List[str]:
 async def humanized_delay(min_s: float = 2.8, max_s: float = 7.5):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
+def _google_url(dork: str, start: int = 0, basic: bool = True) -> str:
+    """Build Google search URL. basic=True uses gbv=1 (simpler HTML)."""
+    query = quote_plus(dork)
+    # gbv=1 → Google Basic Version (HTML, less JS)
+    extra = "&gbv=1" if basic else ""
+    return f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}{extra}"
+
 # ---------------------------------------------------------------------------
-# Tier 1 & Tier 2: curl_cffi with scheme candidates + DIAG
+# Tier 1 & Tier 2: curl_cffi
 # ---------------------------------------------------------------------------
 async def fetch_with_curl(
     session: AsyncSession,
@@ -313,31 +318,39 @@ async def fetch_with_curl(
     impersonate: str = "chrome120",
     tier_label: str = "TIER1",
 ) -> Tuple[Optional[str], str, bool]:
-    """Returns (html, final_url, is_poisoned)"""
+    """Returns (html, final_url, is_poisoned/unusable)"""
     global scorer
 
-    query = quote_plus(dork)
-    url = f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}"
-
+    url = _google_url(dork, start, basic=True)
     headers = get_stealth_headers(mobile_bias=0.20)
     raw_proxy = await scorer.get_best_proxy()
 
     print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)}")
 
+    async def _try_once(proxy_url: Optional[str], scheme: str):
+        t0 = time.time()
+        resp = await session.get(
+            url,
+            headers=headers,
+            proxy=proxy_url,
+            timeout=28,
+            allow_redirects=True,
+            impersonate=impersonate,
+        )
+        final_url = str(resp.url) if hasattr(resp, "url") else url
+        html = resp.text or ""
+        elapsed = time.time() - t0
+        print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
+        return resp.status_code, html, final_url, elapsed
+
     if not raw_proxy:
         print("[DIAG][PROXY] no proxy available → direct")
         try:
-            t0 = time.time()
-            resp = await session.get(url, headers=headers, timeout=28, allow_redirects=True, impersonate=impersonate)
-            html = resp.text or ""
-            final_url = str(resp.url) if hasattr(resp, "url") else url
-            elapsed = time.time() - t0
-            poisoned = is_poisoned(html, final_url) if resp.status_code == 200 else False
-            print(f"[DIAG][HTTP] tier={tier_label} scheme=direct status={resp.status_code} bytes={len(html)} final_url={final_url[:80]} elapsed={elapsed:.2f}s")
-            if resp.status_code == 200 and not poisoned:
+            status, html, final_url, _ = await _try_once(None, "direct")
+            if status == 200 and is_usable_search_html(html, final_url):
+                print(f"[DIAG][PAGE_TYPE] {classify_google_page(html)} → usable")
                 return html, final_url, False
-            if resp.status_code == 200 and poisoned:
-                print(f"[DIAG][POISON] detected=true reason={_poison_reason(html, final_url)}")
+            print(f"[DIAG][PAGE_TYPE] {classify_google_page(html)} → unusable")
             return None, final_url, True
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme=direct exception={type(e).__name__}: {e}")
@@ -349,36 +362,24 @@ async def fetch_with_curl(
 
     for proxy_url in candidates:
         scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
-
         try:
-            t0 = time.time()
-            resp = await session.get(
-                url,
-                headers=headers,
-                proxy=proxy_url,
-                timeout=28,
-                allow_redirects=True,
-                impersonate=impersonate,
-            )
-            final_url = str(resp.url) if hasattr(resp, "url") else url
-            html = resp.text or ""
-            elapsed = time.time() - t0
+            status, html, final_url, elapsed = await _try_once(proxy_url, scheme)
 
-            print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} status={resp.status_code} bytes={len(html)} final_url={final_url[:80]} elapsed={elapsed:.2f}s")
+            if status == 200:
+                usable = is_usable_search_html(html, final_url)
+                page_type = classify_google_page(html)
+                print(f"[DIAG][PAGE_TYPE] {page_type} → {'usable' if usable else 'unusable'}")
 
-            if resp.status_code == 200:
-                if is_poisoned(html, final_url):
-                    reason = _poison_reason(html, final_url)
-                    print(f"[DIAG][POISON] detected=true reason={reason}")
-                    await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                    continue
-                else:
-                    print(f"[DIAG][POISON] detected=false")
+                if usable:
                     await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
                     return html, final_url, False
+                else:
+                    # Connectivity ok but not search results — count as soft fail, try next scheme
+                    await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                    continue
             else:
                 await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                if resp.status_code in (403, 429, 503):
+                if status in (403, 429, 503):
                     continue
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} exception={type(e).__name__}: {e}")
@@ -387,22 +388,20 @@ async def fetch_with_curl(
     return None, url, True
 
 # ---------------------------------------------------------------------------
-# Tier 3: Unified BrowserEngine + DIAG
+# Tier 3: BrowserEngine (full JS rendering)
 # ---------------------------------------------------------------------------
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
     global scorer
 
-    query = quote_plus(dork)
-    url = f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}"
+    # Full Google (no gbv) so Chromium can render real results
+    url = _google_url(dork, start, basic=False)
 
     raw_proxy = await scorer.get_best_proxy()
     candidates = scorer.get_scheme_candidates(raw_proxy) if raw_proxy else [None]
-
     preferred = candidates[0] if candidates else None
     scheme = preferred.split("://")[0] if preferred and "://" in preferred else None
 
     print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)} preferred_scheme={scheme}")
-
     start_time = time.time()
 
     async with BROWSER_SEMAPHORE:
@@ -417,19 +416,17 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
                 html, final_url = await engine.request(url)
                 elapsed = time.time() - start_time
                 bytes_len = len(html) if html else 0
-                poisoned = is_poisoned(html or "", final_url) if html else True
+                usable = is_usable_search_html(html or "", final_url) if html else False
+                page_type = classify_google_page(html or "") if html else "EMPTY_RESULTS"
 
-                print(f"[DIAG][BROWSER] navigation={'success' if html else 'failed'} bytes={bytes_len} final_url={(final_url or '')[:80]} poisoned={poisoned} elapsed={elapsed:.2f}s")
+                print(f"[DIAG][BROWSER] navigation={'success' if html else 'failed'} bytes={bytes_len} page_type={page_type} usable={usable} elapsed={elapsed:.2f}s")
 
-                if html and not poisoned:
-                    print(f"[DIAG][POISON] detected=false")
+                if html and usable:
                     await scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
                     return html, final_url, False
                 else:
-                    if html and poisoned:
-                        print(f"[DIAG][POISON] detected=true reason={_poison_reason(html, final_url)}")
                     await scorer.record_result(raw_proxy, False, elapsed)
-                    return None, final_url, True
+                    return None, final_url or url, True
 
         except Exception as e:
             print(f"[DIAG][BROWSER] navigation=failed exception={type(e).__name__}: {e}")
@@ -439,28 +436,28 @@ async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str
     return None, url, True
 
 # ---------------------------------------------------------------------------
-# Escalation Matrix for a single page
+# Escalation Matrix
 # ---------------------------------------------------------------------------
 async def fetch_page_with_escalation(
     session: AsyncSession,
     dork: str,
     start: int = 0,
 ) -> Optional[str]:
-    logger.info(f"[TIER1] Ghost attack for dork start={start}")
+    logger.info(f"[TIER1] Ghost attack start={start}")
     html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="chrome120", tier_label="TIER1")
     if html and not poisoned:
         return html
 
-    await humanized_delay(3.5, 6.5)
+    await humanized_delay(2.5, 5.0)
 
-    logger.info("[TIER2] Tactical re-attack with new identity")
+    logger.info("[TIER2] Re-attack with new identity")
     html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="edge99", tier_label="TIER2")
     if html and not poisoned:
         return html
 
-    await humanized_delay(4.0, 8.0)
+    await humanized_delay(3.0, 6.0)
 
-    logger.info("[TIER3] Escalating to unified Chromium BrowserEngine (preferred scheme only)")
+    logger.info("[TIER3] Escalating to Chromium (full render)")
     html, final_url, poisoned = await fetch_with_playwright(dork, start)
     if html and not poisoned:
         return html
@@ -469,12 +466,11 @@ async def fetch_page_with_escalation(
     return None
 
 # ---------------------------------------------------------------------------
-# Main search cycle + DIAG RESPONSE / OUTPUT
+# Main search cycle
 # ---------------------------------------------------------------------------
 async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> int:
     print(f"\n[DIAG][DORK] start | {dork}")
     print(f"🚀 Executing Dork: {dork}")
-    print("   Hybrid Escalation Matrix + Scheme candidates active...")
 
     captured = 0
     start = 0
@@ -489,7 +485,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
         if not html:
             print("[DIAG][RESPONSE] received=false bytes=0")
             print("   ❌ Page acquisition failed after full escalation.")
-            await humanized_delay(5.0, 9.0)
+            await humanized_delay(4.0, 7.0)
             continue
 
         print(f"[DIAG][RESPONSE] received=true bytes={len(html)}")
@@ -497,8 +493,11 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
         domains = parse_google_results(html)
         if not domains:
             print("[DIAG][OUTPUT] domain_candidates=0 new_targets=0 duplicates=0")
-            print("   ⚠️ No usable domains extracted (CSS + Regex both empty).")
-            break
+            print("   ⚠️ No usable domains extracted.")
+            # Do not break hard — try next page / continue cycle
+            start += 30
+            await humanized_delay(3.0, 6.0)
+            continue
 
         new_count = 0
         dup_count = 0
@@ -515,7 +514,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
         print(f"[DIAG][OUTPUT] domain_candidates={len(domains)} new_targets={new_count} duplicates={dup_count}")
 
         start += 30
-        await humanized_delay(3.5, 7.5)
+        await humanized_delay(3.0, 6.5)
 
     print(f"[DIAG][DORK] COMPLETE | captured={captured}")
     return captured
@@ -526,7 +525,7 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
 async def start_feeding():
     global scorer
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.5 (PAGE TYPE CLASSIFICATION)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v1.6 (USABLE RESULTS + FALLBACK)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
 
@@ -559,7 +558,7 @@ async def start_feeding():
                     hits = await execute_search_cycle(session, dork, limit)
                     total_captured += hits
                     print("   💤 Cooling down before next dork...")
-                    await humanized_delay(6.0, 12.0)
+                    await humanized_delay(5.0, 10.0)
 
             else:
                 dork = input("🔥 Enter your Google Dork: ").strip()
@@ -573,7 +572,7 @@ async def start_feeding():
             print("[SCORER] State saved → proxy_scores.json")
 
     print(f"\n🩸 MISSION COMPLETE. Total New Targets: {total_captured}")
-    print("👉 Next: python harvester.py")
+    print("👉 Next: python harvester.py / orchestrator.py")
 
 def main():
     try:
