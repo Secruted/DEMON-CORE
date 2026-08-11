@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DΞMON CORE - HYBRID FEEDER v1.9
+DΞMON CORE - HYBRID FEEDER v2.0
 ================================
-- Parallel scheme race (HTTP/SOCKS4/SOCKS5) with FIRST_COMPLETED
-- Fast-fail probe timeout 10s
-- Winner takes all; losers cancelled immediately
+- Parallel scheme race (HTTP/SOCKS4/SOCKS5) FIRST_COMPLETED
+- Rotate up to PROXY_RETRIES_PER_TIER proxies inside each tier
+  before escalating (dead/CAPTCHA proxies no longer kill the whole tier)
 - Acquisition only; extraction via SearchProvider
 """
 
@@ -14,7 +14,7 @@ import asyncio
 import random
 import logging
 from urllib.parse import quote_plus
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, List, Any, Set
 
 from curl_cffi.requests import AsyncSession
 
@@ -33,10 +33,10 @@ MAX_BROWSER_SESSIONS = int(os.getenv("MAX_BROWSER_SESSIONS", "1"))
 BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_BROWSER_SESSIONS)
 SEARCH_PROVIDER_NAME = os.getenv("SEARCH_PROVIDER", "google")
 
-# Fast-fail: handshake / scheme probe (parallel race)
 SCHEME_PROBE_TIMEOUT = float(os.getenv("SCHEME_PROBE_TIMEOUT", "10"))
-# Full fetch timeout after scheme is known
 FETCH_TIMEOUT = float(os.getenv("FETCH_TIMEOUT", "20"))
+# How many different proxies to try inside ONE tier before giving up that tier
+PROXY_RETRIES_PER_TIER = int(os.getenv("PROXY_RETRIES_PER_TIER", "5"))
 
 logger = logging.getLogger("HYBRID_FEEDER")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -103,7 +103,7 @@ def _google_url(dork: str, start: int = 0, basic: bool = True) -> str:
     return f"https://www.google.com/search?q={query}&num=30&hl=en&start={start}{extra}"
 
 # ---------------------------------------------------------------------------
-# Parallel scheme race — FIRST_COMPLETED, cancel losers
+# Parallel scheme race
 # ---------------------------------------------------------------------------
 async def _race_schemes(
     session: AsyncSession,
@@ -113,14 +113,6 @@ async def _race_schemes(
     impersonate: str,
     tier_label: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], float]:
-    """
-    Fire all scheme candidates concurrently.
-    First successful response (status 200 + body) wins.
-    Remaining tasks are cancelled immediately.
-
-    Returns: (proxy_url, scheme, html, final_url, elapsed) or (None, None, None, None, elapsed)
-    """
-
     async def _probe(proxy_url: str) -> Tuple[bool, str, str, int, str, str, float]:
         scheme = proxy_url.split("://")[0] if "://" in proxy_url else "unknown"
         t0 = time.time()
@@ -175,10 +167,8 @@ async def _race_schemes(
 
             if ok and winner is None:
                 winner = (proxy_url, scheme, html, final_url, elapsed)
-                # Mercy kill: cancel all remaining probes immediately
                 for p in pending:
                     p.cancel()
-                # Drain cancellations
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
                 pending.clear()
@@ -194,60 +184,21 @@ async def _race_schemes(
     print(f"[DIAG][RACE] all schemes failed total_race={total_elapsed:.2f}s")
     return None, None, None, None, total_elapsed
 
-# ---------------------------------------------------------------------------
-# Tier 1 & Tier 2: curl_cffi + parallel scheme race
-# ---------------------------------------------------------------------------
-async def fetch_with_curl(
+
+async def _try_one_proxy_curl(
     session: AsyncSession,
-    dork: str,
-    start: int = 0,
-    impersonate: str = "chrome120",
-    tier_label: str = "TIER1",
+    url: str,
+    headers: dict,
+    raw_proxy: str,
+    impersonate: str,
+    tier_label: str,
 ) -> Tuple[Optional[str], str, bool]:
-    global scorer
-
-    url = _google_url(dork, start, basic=True)
-    headers = get_stealth_headers(mobile_bias=0.20)
-    raw_proxy = await scorer.get_best_proxy()
-
-    print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)}")
-
-    # --- Direct (no proxy) ---
-    if not raw_proxy:
-        print("[DIAG][PROXY] no proxy available → direct")
-        try:
-            t0 = time.time()
-            resp = await session.get(
-                url,
-                headers=headers,
-                timeout=FETCH_TIMEOUT,
-                allow_redirects=True,
-                impersonate=impersonate,
-            )
-            html = resp.text or ""
-            final_url = str(resp.url) if hasattr(resp, "url") else url
-            elapsed = time.time() - t0
-            print(f"[DIAG][HTTP] tier={tier_label} scheme=direct status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
-            if not html:
-                print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
-                return None, final_url, True
-            page_type = provider.classify(html) if provider else "UNKNOWN"
-            if resp.status_code == 200 and is_usable_search_html(html, final_url):
-                print(f"[DIAG][PAGE_TYPE] {page_type} → usable")
-                return html, final_url, False
-            print(f"[DIAG][PAGE_TYPE] {page_type} → unusable")
-            return None, final_url, True
-        except Exception as e:
-            print(f"[DIAG][HTTP] tier={tier_label} scheme=direct exception={type(e).__name__}: {e}")
-            print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
-            return None, url, True
-
+    """Attempt a single proxy (with scheme race). Returns (html, final_url, poisoned)."""
     candidates = scorer.get_scheme_candidates(raw_proxy)
     schemes = [c.split("://")[0] for c in candidates]
-    print(f"[DIAG][PROXY] scheme candidates={schemes}")
+    print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)} candidates={schemes}")
     start_time = time.time()
 
-    # Single known scheme → no race needed
     if len(candidates) == 1:
         proxy_url = candidates[0]
         scheme = schemes[0]
@@ -264,7 +215,10 @@ async def fetch_with_curl(
             html = resp.text or ""
             final_url = str(resp.url) if hasattr(resp, "url") else url
             elapsed = time.time() - t0
-            print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s")
+            print(
+                f"[DIAG][HTTP] tier={tier_label} scheme={scheme} "
+                f"status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s"
+            )
 
             if resp.status_code == 200 and html:
                 usable = is_usable_search_html(html, final_url)
@@ -280,11 +234,9 @@ async def fetch_with_curl(
             return None, final_url, True
         except Exception as e:
             print(f"[DIAG][HTTP] tier={tier_label} scheme={scheme} exception={type(e).__name__}: {e}")
-            print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
             await scorer.record_result(raw_proxy, False, time.time() - start_time)
             return None, url, True
 
-    # --- Parallel race for unknown multi-scheme proxies ---
     proxy_url, scheme, html, final_url, elapsed = await _race_schemes(
         session, url, headers, candidates, impersonate, tier_label
     )
@@ -293,12 +245,9 @@ async def fetch_with_curl(
         usable = is_usable_search_html(html, final_url or url)
         page_type = provider.classify(html) if provider else "UNKNOWN"
         print(f"[DIAG][PAGE_TYPE] {page_type} → {'usable' if usable else 'unusable'}")
-
         if usable:
             await scorer.record_result(raw_proxy, True, time.time() - start_time, scheme=scheme)
             return html, final_url or url, False
-
-        # Scheme connected but content not usable — soft fail
         await scorer.record_result(raw_proxy, False, time.time() - start_time)
         return None, final_url or url, True
 
@@ -306,64 +255,155 @@ async def fetch_with_curl(
     print("[DIAG][PAGE_TYPE] FETCH_FAILED → unusable")
     return None, url, True
 
+
 # ---------------------------------------------------------------------------
-# Tier 3: BrowserEngine
+# Tier 1 & Tier 2: curl + multi-proxy rotation
+# ---------------------------------------------------------------------------
+async def fetch_with_curl(
+    session: AsyncSession,
+    dork: str,
+    start: int = 0,
+    impersonate: str = "chrome120",
+    tier_label: str = "TIER1",
+) -> Tuple[Optional[str], str, bool]:
+    global scorer
+
+    url = _google_url(dork, start, basic=True)
+    headers = get_stealth_headers(mobile_bias=0.20)
+
+    tried: Set[str] = set()
+
+    for attempt in range(1, PROXY_RETRIES_PER_TIER + 1):
+        raw_proxy = await scorer.get_best_proxy()
+
+        if not raw_proxy:
+            print("[DIAG][PROXY] no proxy available → direct")
+            try:
+                t0 = time.time()
+                resp = await session.get(
+                    url,
+                    headers=headers,
+                    timeout=FETCH_TIMEOUT,
+                    allow_redirects=True,
+                    impersonate=impersonate,
+                )
+                html = resp.text or ""
+                final_url = str(resp.url) if hasattr(resp, "url") else url
+                elapsed = time.time() - t0
+                print(
+                    f"[DIAG][HTTP] tier={tier_label} scheme=direct "
+                    f"status={resp.status_code} bytes={len(html)} elapsed={elapsed:.2f}s"
+                )
+                if not html:
+                    return None, final_url, True
+                page_type = provider.classify(html) if provider else "UNKNOWN"
+                if resp.status_code == 200 and is_usable_search_html(html, final_url):
+                    print(f"[DIAG][PAGE_TYPE] {page_type} → usable")
+                    return html, final_url, False
+                print(f"[DIAG][PAGE_TYPE] {page_type} → unusable")
+                return None, final_url, True
+            except Exception as e:
+                print(f"[DIAG][HTTP] tier={tier_label} scheme=direct exception={type(e).__name__}: {e}")
+                return None, url, True
+
+        # Skip already-tried proxy in this tier loop
+        if raw_proxy in tried:
+            print(f"[DIAG][PROXY] skip already-tried {_mask_proxy(raw_proxy)} ({attempt}/{PROXY_RETRIES_PER_TIER})")
+            # Force scorer to deprioritize by recording soft fail if stuck
+            await scorer.record_result(raw_proxy, False, 0.01)
+            continue
+
+        tried.add(raw_proxy)
+        print(f"[DIAG][PROXY] attempt={attempt}/{PROXY_RETRIES_PER_TIER}")
+
+        html, final_url, poisoned = await _try_one_proxy_curl(
+            session, url, headers, raw_proxy, impersonate, tier_label
+        )
+
+        if html and not poisoned:
+            return html, final_url, False
+
+        # Dead / CAPTCHA / unusable → rotate to next proxy inside same tier
+        print(f"[DIAG][PROXY] rotate after failure attempt={attempt}/{PROXY_RETRIES_PER_TIER}")
+
+    print(f"[DIAG][PROXY] exhausted {PROXY_RETRIES_PER_TIER} proxies in {tier_label}")
+    return None, url, True
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: BrowserEngine + multi-proxy rotation
 # ---------------------------------------------------------------------------
 async def fetch_with_playwright(dork: str, start: int = 0) -> Tuple[Optional[str], str, bool]:
     global scorer
 
     url = _google_url(dork, start, basic=False)
+    tried: Set[str] = set()
 
-    raw_proxy = await scorer.get_best_proxy()
-    candidates = scorer.get_scheme_candidates(raw_proxy) if raw_proxy else [None]
-    preferred = candidates[0] if candidates else None
-    scheme = preferred.split("://")[0] if preferred and "://" in preferred else None
+    for attempt in range(1, PROXY_RETRIES_PER_TIER + 1):
+        raw_proxy = await scorer.get_best_proxy()
+        if not raw_proxy:
+            print("[DIAG][BROWSER] no proxy available")
+            return None, url, True
 
-    print(f"[DIAG][PROXY] selected={_mask_proxy(raw_proxy)} preferred_scheme={scheme}")
-    start_time = time.time()
+        if raw_proxy in tried:
+            await scorer.record_result(raw_proxy, False, 0.01)
+            continue
 
-    async with BROWSER_SEMAPHORE:
-        try:
-            async with BrowserEngine(proxy=preferred, block_resources=True) as engine:
-                if not engine.enabled:
-                    print("[DIAG][BROWSER] navigation=failed reason=engine_not_enabled")
-                    print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
-                    if raw_proxy:
+        tried.add(raw_proxy)
+        candidates = scorer.get_scheme_candidates(raw_proxy)
+        preferred = candidates[0] if candidates else None
+        scheme = preferred.split("://")[0] if preferred and "://" in preferred else None
+
+        print(
+            f"[DIAG][PROXY] attempt={attempt}/{PROXY_RETRIES_PER_TIER} "
+            f"selected={_mask_proxy(raw_proxy)} preferred_scheme={scheme}"
+        )
+        start_time = time.time()
+
+        async with BROWSER_SEMAPHORE:
+            try:
+                async with BrowserEngine(proxy=preferred, block_resources=True) as engine:
+                    if not engine.enabled:
+                        print("[DIAG][BROWSER] navigation=failed reason=engine_not_enabled")
                         await scorer.record_result(raw_proxy, False, time.time() - start_time)
-                    return None, url, True
+                        continue
 
-                html, final_url = await engine.request(url)
-                elapsed = time.time() - start_time
-                bytes_len = len(html) if html else 0
+                    html, final_url = await engine.request(url)
+                    elapsed = time.time() - start_time
+                    bytes_len = len(html) if html else 0
 
-                if not html or bytes_len == 0:
-                    print("[DIAG][BROWSER] navigation=failed bytes=0")
-                    print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
+                    if not html or bytes_len == 0:
+                        print("[DIAG][BROWSER] navigation=failed bytes=0")
+                        print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
+                        await scorer.record_result(raw_proxy, False, elapsed)
+                        continue
+
+                    page_type = provider.classify(html) if provider else "UNKNOWN"
+                    usable = is_usable_search_html(html, final_url)
+
+                    print(
+                        f"[DIAG][BROWSER] navigation=success bytes={bytes_len} "
+                        f"page_type={page_type} usable={usable} elapsed={elapsed:.2f}s"
+                    )
+
+                    if usable:
+                        await scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
+                        return html, final_url, False
+
+                    # CAPTCHA / blocked → burn this proxy, try next
                     await scorer.record_result(raw_proxy, False, elapsed)
-                    return None, final_url or url, True
+                    print(f"[DIAG][PROXY] rotate after {page_type} attempt={attempt}/{PROXY_RETRIES_PER_TIER}")
+                    continue
 
-                page_type = provider.classify(html) if provider else "UNKNOWN"
-                usable = is_usable_search_html(html, final_url)
-
-                print(
-                    f"[DIAG][BROWSER] navigation=success bytes={bytes_len} "
-                    f"page_type={page_type} usable={usable} elapsed={elapsed:.2f}s"
-                )
-
-                if usable:
-                    await scorer.record_result(raw_proxy, True, elapsed, scheme=scheme)
-                    return html, final_url, False
-                else:
-                    await scorer.record_result(raw_proxy, False, elapsed)
-                    return None, final_url or url, True
-
-        except Exception as e:
-            print(f"[DIAG][BROWSER] navigation=failed exception={type(e).__name__}: {e}")
-            print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
-            if raw_proxy:
+            except Exception as e:
+                print(f"[DIAG][BROWSER] navigation=failed exception={type(e).__name__}: {e}")
+                print("[DIAG][PAGE_TYPE] NAVIGATION_FAILED → unusable")
                 await scorer.record_result(raw_proxy, False, time.time() - start_time)
+                continue
 
+    print(f"[DIAG][PROXY] exhausted {PROXY_RETRIES_PER_TIER} proxies in TIER3")
     return None, url, True
+
 
 # ---------------------------------------------------------------------------
 # Escalation Matrix
@@ -374,14 +414,18 @@ async def fetch_page_with_escalation(
     start: int = 0,
 ) -> Optional[str]:
     logger.info(f"[TIER1] Ghost attack start={start}")
-    html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="chrome120", tier_label="TIER1")
+    html, final_url, poisoned = await fetch_with_curl(
+        session, dork, start, impersonate="chrome120", tier_label="TIER1"
+    )
     if html and not poisoned:
         return html
 
     await humanized_delay(2.5, 5.0)
 
     logger.info("[TIER2] Re-attack with new identity")
-    html, final_url, poisoned = await fetch_with_curl(session, dork, start, impersonate="edge99", tier_label="TIER2")
+    html, final_url, poisoned = await fetch_with_curl(
+        session, dork, start, impersonate="edge99", tier_label="TIER2"
+    )
     if html and not poisoned:
         return html
 
@@ -394,6 +438,7 @@ async def fetch_page_with_escalation(
 
     logger.warning("[ESCALATION] All tiers failed for this page")
     return None
+
 
 # ---------------------------------------------------------------------------
 # Main search cycle
@@ -442,7 +487,10 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
             else:
                 dup_count += 1
 
-        print(f"[DIAG][OUTPUT] domain_candidates={len(domains)} new_targets={new_count} duplicates={dup_count}")
+        print(
+            f"[DIAG][OUTPUT] domain_candidates={len(domains)} "
+            f"new_targets={new_count} duplicates={dup_count}"
+        )
 
         start += 30
         await humanized_delay(3.0, 6.5)
@@ -450,17 +498,19 @@ async def execute_search_cycle(session: AsyncSession, dork: str, limit: int) -> 
     print(f"[DIAG][DORK] COMPLETE | captured={captured}")
     return captured
 
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 async def start_feeding():
     global scorer, provider
 
-    print("\n🕷️  DΞMON HYBRID FEEDER v1.9 (PARALLEL SCHEME RACE)  🕷️")
+    print("\n🕷️  DΞMON HYBRID FEEDER v2.0 (MULTI-PROXY ROTATION)  🕷️")
     print("---------------------------------------------------------------")
     print(f"[CONFIG] MAX_BROWSER_SESSIONS = {MAX_BROWSER_SESSIONS}")
     print(f"[CONFIG] SEARCH_PROVIDER = {SEARCH_PROVIDER_NAME}")
     print(f"[CONFIG] SCHEME_PROBE_TIMEOUT = {SCHEME_PROBE_TIMEOUT}s")
+    print(f"[CONFIG] PROXY_RETRIES_PER_TIER = {PROXY_RETRIES_PER_TIER}")
 
     provider = get_search_provider(SEARCH_PROVIDER_NAME)
     print(f"[PROVIDER] Active: {provider.name}")
@@ -510,11 +560,13 @@ async def start_feeding():
     print(f"\n🩸 MISSION COMPLETE. Total New Targets: {total_captured}")
     print("👉 Next: python harvester.py / orchestrator.py")
 
+
 def main():
     try:
         asyncio.run(start_feeding())
     except KeyboardInterrupt:
         print("\n🛑 Hybrid Feeder terminated.")
+
 
 if __name__ == "__main__":
     main()
