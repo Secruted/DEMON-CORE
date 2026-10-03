@@ -1,11 +1,9 @@
 import time
-import random
-import asyncio
-import aiohttp
 import logging
-from aiohttp import TCPConnector, ClientTimeout
+from aiohttp import TCPConnector, ClientTimeout, ClientSession
 from proxy_scoring import ProxyScorer
 from stealth import get_stealth_headers
+
 
 class TransportManager:
     def __init__(self, transport_cfg):
@@ -26,13 +24,15 @@ class TransportManager:
                 limit=3000,
                 ssl=False,
                 enable_cleanup_closed=True,
-                force_close=False
+                force_close=False,
             )
-            self.session = aiohttp.ClientSession(
+            self.session = ClientSession(
                 connector=connector,
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-            self.logger.info("[TRANSPORT] Async session + ProxyScorer + Stealth headers online.")
+            self.logger.info(
+                "[TRANSPORT] Async session + ProxyScorer + Stealth headers online."
+            )
 
     async def close_session(self):
         if self.session and not self.session.closed:
@@ -43,12 +43,17 @@ class TransportManager:
         if not self.session:
             await self.init_session()
 
+        # التوافق العكسي: get_stealth_headers ما زالت تُرجع dict فقط
         headers = get_stealth_headers(mobile_bias=0.3)
 
         self.current_proxy = await self.scorer.get_best_proxy()
         formatted_proxy = None
         if self.current_proxy:
-            formatted_proxy = self.current_proxy if "://" in self.current_proxy else f"http://{self.current_proxy}"
+            formatted_proxy = (
+                self.current_proxy
+                if "://" in self.current_proxy
+                else f"http://{self.current_proxy}"
+            )
 
         start_time = time.time()
         success = False
@@ -60,7 +65,7 @@ class TransportManager:
                 url,
                 headers=headers,
                 proxy=formatted_proxy,
-                allow_redirects=True
+                allow_redirects=True,
             ) as response:
                 if response.status == 200:
                     text = await response.text()
@@ -74,7 +79,7 @@ class TransportManager:
             await self.scorer.record_result(
                 proxy=self.current_proxy,
                 success=success,
-                response_time=elapsed
+                response_time=elapsed,
             )
 
         if success:

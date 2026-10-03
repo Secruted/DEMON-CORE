@@ -1,0 +1,62 @@
+[
+  {
+    "name": "chrome_win_131",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "sec_ch_ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+    "sec_ch_ua_mobile": "?0",
+    "sec_ch_ua_platform": "\"Windows\"",
+    "accept_language": "en-US,en;q=0.9",
+    "tls_impersonate": "chrome131",
+    "platform": "windows",
+    "is_mobile": false,
+    "browser_family": "chrome"
+  },
+  {
+    "name": "firefox_win_133",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "sec_ch_ua": "",
+    "sec_ch_ua_mobile": "?0",
+    "sec_ch_ua_platform": "\"Windows\"",
+    "accept_language": "en-US,en;q=0.5",
+    "tls_impersonate": "firefox133",
+    "platform": "windows",
+    "is_mobile": false,
+    "browser_family": "firefox"
+  },
+  {
+    "name": "chrome_android_131",
+    "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "sec_ch_ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+    "sec_ch_ua_mobile": "?1",
+    "sec_ch_ua_platform": "\"Android\"",
+    "accept_language": "en-US,en;q=0.9",
+    "tls_impersonate": "chrome131",
+    "platform": "android",
+    "is_mobile": true,
+    "browser_family": "chrome"
+  },
+  {
+    "name": "safari_ios_18",
+    "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+    "sec_ch_ua": "",
+    "sec_ch_ua_mobile": "?1",
+    "sec_ch_ua_platform": "\"iOS\"",
+    "accept_language": "en-US,en;q=0.9",
+    "tls_impersonate": "safari184",
+    "platform": "ios",
+    "is_mobile": true,
+    "browser_family": "safari"
+  },
+  {
+    "name": "edge_win_131",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "sec_ch_ua": "\"Microsoft Edge\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+    "sec_ch_ua_mobile": "?0",
+    "sec_ch_ua_platform": "\"Windows\"",
+    "accept_language": "en-US,en;q=0.9",
+    "tls_impersonate": "chrome131",
+    "platform": "windows",
+    "is_mobile": false,
+    "browser_family": "edge"
+  }
+]
