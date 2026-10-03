@@ -12,7 +12,7 @@
 | `harvester.py` | Mission execution engine |
 | `router.py` | Target & path generator |
 | `content_parser.py` | Hybrid JSON / HTML content analyzer |
-| `db_manager.py` | Encrypted SQLite database manager |
+| `db_manager.py` | Encrypted SQLite database manager (+ `log_session_event`) |
 | `transport_manager.py` | Network layer with mobile mimicry & proxy support |
 | `proxy_manager.py` | Advanced proxy health monitoring & rotation |
 | `maggie.py` | Dead proxy collector |
@@ -24,8 +24,9 @@
 | `bip39_english.txt` | Official BIP-39 English wordlist |
 | `domain_parser.py` | OSINT domain & subdomain reconnaissance |
 | `feeder.py` | Google Dork based target acquisition |
-| `messenger.py` | Alert dispatcher service |
+| `messenger.py` | Alert dispatcher service (+ `dispatch_alert`) |
 | `telegram_notifier.py` | Telegram notification handler |
+| `remote_orchestrator.py` | Persistent outbound TCP command client (new unit) |
 | `elite_check.py` | Elite proxy quality checker |
 | `check_sentinel.py` | Quick proxy health checker |
 | `clear_cooling.py` | Hospital room cleaner |
@@ -36,10 +37,27 @@
 
 ## Configuration Files
 
-- `runtime.json`
+- `runtime.json` (now includes `host` / `port` for remote_orchestrator)
 - `strategy.json`
 - `tracker.json`
 - `transport.json`
+
+---
+
+## remote_orchestrator
+
+Standalone unit that maintains a persistent non-blocking TCP connection to a controller defined in `runtime.json`.
+
+- Reads `host` and `port` from `runtime.json`
+- Executes newline-framed commands via `subprocess.run`
+- Logs every session via `db_manager.log_session_event`
+- Broadcasts alerts via `messenger.dispatch_alert`
+- Auto-reconnects every 5 seconds on disconnect
+
+Run:
+```bash
+python remote_orchestrator.py
+```
 
 ---
 
