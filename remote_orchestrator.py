@@ -64,7 +64,7 @@ def load_config(path: str = CONFIG_PATH) -> Tuple[str, int]:
             raise ValueError("Invalid network port boundary detected.")
         return host, port
     except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        logger.warning("config load issue (%s) – using defaults 127.0.0.1:8080", exc)
+        logger.warning("config load issue (%s) – using defaults 127.0.0.1:8080", exp)
         return "127.0.0.1", 8080
 
 
@@ -103,7 +103,7 @@ def execute_command(command_str: str) -> Tuple[str, str]:
         return f"[ERROR] Command boundary execution timeout after {COMMAND_TIMEOUT}s", "error"
     except FileNotFoundError:
         return "[ERROR] Executable file or instruction entity not found on local path.", "error"
-    except Exception as exc:
+    except Exception as exp:
         return f"[ERROR] Execution engine failure: {exc}", "error"
 
 
@@ -112,7 +112,7 @@ def send_all(sock: socket.socket, data: bytes) -> bool:
     try:
         sock.sendall(data)
         return True
-    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+    except (BrokenPipeError, ConnectionResetError, OSError) as exp:
         logger.error("Transport layer send failure: %s", exp)
         return False
 
@@ -124,7 +124,7 @@ def _safe_log_session(command_str: str, output: str, status: str) -> None:
     try:
         if hasattr(db_manager, "log_session_event"):
             db_manager.log_session_event(command_str, output, status)
-    except Exception as exc:
+    except Exception as exp:
         logger.error("Coupled module dependency failure [db_manager]: %s", exp)
 
 
