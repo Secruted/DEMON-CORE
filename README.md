@@ -1,4 +1,4 @@
-# DEMON CORE 🕷️🇨🇳
+# Satanic essence 🧠🕷️
 
 **Modular Proxy-Powered Harvesting & Reconnaissance System**
 
