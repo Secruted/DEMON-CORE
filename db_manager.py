@@ -5,6 +5,7 @@ import os
 import logging
 import time
 import asyncio
+from pathlib import Path
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -12,6 +13,29 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.exceptions import InvalidKey
 
 logger = logging.getLogger(__name__)
+
+# Session event log path used by remote_orchestrator (sync side-channel)
+SESSION_LOG = Path("session_events.log")
+
+
+def log_session_event(command: str, output: str, status: str) -> None:
+    """
+    Synchronous side-channel logger for remote_orchestrator.
+    Appends a structured record of every executed command.
+    Does not touch the encrypted vault (keeps coupling lightweight).
+    """
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        record = (
+            f"[{ts}] status={status} | cmd={command[:200]}\n"
+            f"--- output ---\n{output[:2000]}\n--- end ---\n"
+        )
+        with open(SESSION_LOG, "a", encoding="utf-8") as fh:
+            fh.write(record)
+        logger.info("[DB] session event recorded (status=%s)", status)
+    except Exception as e:
+        logger.error("log_session_event failed: %s", e)
+
 
 class DBManager:
     def __init__(self, db_path, password):
