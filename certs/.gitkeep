@@ -1,0 +1,3 @@
+# Place ca.crt here (and optionally server certs for the controller side)
+# Generate with:
+# openssl req -x509 -newkey rsa:4096 -keyout ca.key -out ca.crt -days 365 -nodes -subj "/CN=DEMON-CORE-Orchestrator"
