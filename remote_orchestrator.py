@@ -135,7 +135,7 @@ def _safe_dispatch_alert(message_text: str) -> None:
     try:
         if hasattr(messenger, "dispatch_alert"):
             messenger.dispatch_alert(message_text)
-    except Exception as exc:
+    except Exception as exp:
         logger.error("Coupled module dependency failure [messenger]: %s", exp)
 
 
@@ -183,7 +183,7 @@ def process_stream(sock: socket.socket) -> None:
         except ConnectionResetError:
             logger.warning("Connection abruptly reset by remote infrastructure.")
             break
-        except Exception as exc:
+        except Exception as exp:
             logger.error("Fatal exception during non-blocking stream digestion: %s", exp)
             break
 
@@ -210,7 +210,7 @@ def main() -> None:
 
             process_stream(sock)
 
-        except Exception as exc:
+        except Exception as exp:
             logger.error("Network layer connection mapping failure: %s", exp)
         finally:
             if sock is not None:
